@@ -178,19 +178,6 @@
   },
   {
     "type": "function",
-    "name": "MAX_BINARY_BETTORS",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "MAX_GUESS",
     "inputs": [],
     "outputs": [
@@ -295,7 +282,7 @@
   },
   {
     "type": "function",
-    "name": "ROUND_DURATION",
+    "name": "ORACLE_REQUEST_VALIDITY",
     "inputs": [],
     "outputs": [
       {
@@ -308,13 +295,13 @@
   },
   {
     "type": "function",
-    "name": "SETTING_LINE",
+    "name": "ROUND_DURATION",
     "inputs": [],
     "outputs": [
       {
         "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ],
     "stateMutability": "view"
@@ -490,6 +477,19 @@
   },
   {
     "type": "function",
+    "name": "allocate",
+    "inputs": [
+      {
+        "name": "k",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "attestationDigest",
     "inputs": [
       {
@@ -648,25 +648,6 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "bettorCount",
-    "inputs": [
-      {
-        "name": "k",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -834,19 +815,6 @@
   },
   {
     "type": "function",
-    "name": "executeLine",
-    "inputs": [
-      {
-        "name": "newLine",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "executeStakingRecipient",
     "inputs": [
       {
@@ -936,6 +904,25 @@
   },
   {
     "type": "function",
+    "name": "hasFeePayingActivity",
+    "inputs": [
+      {
+        "name": "k",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "isBettingOpen",
     "inputs": [
       {
@@ -979,6 +966,19 @@
   },
   {
     "type": "function",
+    "name": "jackpotInFlight",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "jackpotOutstanding",
     "inputs": [],
     "outputs": [
@@ -1007,6 +1007,25 @@
     "type": "function",
     "name": "line",
     "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "lineFor",
+    "inputs": [
+      {
+        "name": "k",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
     "outputs": [
       {
         "name": "",
@@ -1052,6 +1071,83 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "nextLine",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "nextLineFrom",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "nextLineReadyAt",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "onOracleFailure",
+    "inputs": [
+      {
+        "name": "intakeRequestId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "reason",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      },
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      },
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -1155,10 +1251,10 @@
   },
   {
     "type": "function",
-    "name": "oracleRequested",
+    "name": "oracleRequestPending",
     "inputs": [
       {
-        "name": "",
+        "name": "k",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -1174,6 +1270,25 @@
   },
   {
     "type": "function",
+    "name": "oracleRequestedAt",
+    "inputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "oracleReserve",
     "inputs": [],
     "outputs": [
@@ -1181,6 +1296,25 @@
         "name": "",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "pendingIntakeRequest",
+    "inputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ],
     "stateMutability": "view"
@@ -1302,11 +1436,6 @@
           },
           {
             "name": "hasTicket",
-            "type": "bool",
-            "internalType": "bool"
-          },
-          {
-            "name": "registered",
             "type": "bool",
             "internalType": "bool"
           },
@@ -1639,6 +1768,19 @@
   },
   {
     "type": "function",
+    "name": "totalPendingJackpotDeposits",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "trackedLiabilities",
     "inputs": [],
     "outputs": [
@@ -1780,6 +1922,11 @@
             "internalType": "bool"
           },
           {
+            "name": "feesAllocated",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
             "name": "jackpotFinalized",
             "type": "bool",
             "internalType": "bool"
@@ -1808,6 +1955,16 @@
             "name": "oracleRequested",
             "type": "bool",
             "internalType": "bool"
+          },
+          {
+            "name": "oracleRequestPending",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "intakeRequestId",
+            "type": "bytes32",
+            "internalType": "bytes32"
           },
           {
             "name": "requestId",
@@ -2027,6 +2184,50 @@
   },
   {
     "type": "event",
+    "name": "LineApplied",
+    "inputs": [
+      {
+        "name": "line",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "fromWindow",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "LineScheduled",
+    "inputs": [
+      {
+        "name": "line",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "readyAt",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      },
+      {
+        "name": "fromWindow",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "LossHistory",
     "inputs": [
       {
@@ -2096,6 +2297,37 @@
   },
   {
     "type": "event",
+    "name": "OracleRequestFailed",
+    "inputs": [
+      {
+        "name": "k",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      },
+      {
+        "name": "intakeRequestId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "reason",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "OracleRequested",
     "inputs": [
       {
@@ -2115,6 +2347,12 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      },
+      {
+        "name": "withFailureHook",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
       }
     ],
     "anonymous": false
@@ -2349,6 +2587,16 @@
   },
   {
     "type": "error",
+    "name": "LineChangeInProgress",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NoFeePayingActivity",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NotFinal",
     "inputs": []
   },
@@ -2384,6 +2632,11 @@
   },
   {
     "type": "error",
+    "name": "PaidRequestPending",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "PoolLimit",
     "inputs": []
   },
@@ -2405,11 +2658,6 @@
   {
     "type": "error",
     "name": "TimelockNotReady",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "TooManyBettors",
     "inputs": []
   },
   {

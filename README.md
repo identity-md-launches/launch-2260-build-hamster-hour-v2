@@ -17,8 +17,9 @@ forge fmt --check
 
 Solidity 0.8.26, Cancun, optimizer 200 runs, `bytecode_hash = "none"`. The fuzz seed is also pinned
 in `foundry.toml`. The only dependency is forge-std, vendored as ordinary files under `lib/`. Tests
-use no environment variables, FFI or filesystem access; IMD is a mock etched at the real IMD address.
-The ABI is exported to `abi/HamsterHour.json`.
+use no environment variables, FFI or filesystem access; IMD is a mock etched at the real IMD address
+and the Intake is a mock that delivers with the documented 200,000 gas stipend. The ABI is exported
+to `abi/HamsterHour.json`. Runtime size is about 23.1 KB of the 24 KB limit.
 
 ## Deployment parameters (real addresses only)
 
@@ -38,8 +39,9 @@ guidance for the separate manifest step, not a manifest; no `launch.json` is wri
   ends one hour later. Half-open intervals.
 - Betting on window `k` is open while `now < start(k)` and `start(k) <= now + 24h`: up to 24 windows
   ahead, closing strictly at window start.
-- A window is created by its first bet and snapshots the line then. Source and genesis are constants,
-  so they are the same for every window and are bound into every oracle question.
+- A window is created by its first bet and snapshots its line then (`lineFor(k)`, see "After
+  launch": the line of a window never changes once the window can be bet on). Source and genesis
+  are constants, so they are the same for every window and are bound into every oracle question.
 - Settle while `end <= now < end + 48h`. From `now >= end + 48h` the window can only time out, which
   refunds everything in it with no fees.
 
@@ -56,15 +58,33 @@ guidance for the separate manifest step, not a manifest; no `launch.json` is wri
 - Binary fee split on each settled market pool: 5% staking, 2% jackpot, 1% oracle reserve, 1% TEAM,
   remainder (91% plus rounding) to winners pro rata by stake. Ticket split: 5% staking, 1% oracle,
   1% TEAM, remainder (93%) is that window's jackpot contribution.
-- Line fixed at 2100 initially; TEAM can change it with the 12-hour timelock for windows created
-  after execution.
-- At most 256 distinct binary bettors per window (`MAX_BINARY_BETTORS`), see "Mining history".
+- Line fixed at 2100 initially; TEAM can change it with the 12-hour timelock for windows that open
+  after the change is ready.
+- There is no cap on binary bettors and no per-user list anywhere: nothing a sybil can fill.
+
+## Settlement and fee allocation
+
+Settlement has two steps so the Intake callback fits its gas stipend:
+
+1. **Record the result**: the attestation checks below, then `status = Settled`, `result`,
+   `requestId`, replay mark, `Settled` event. This is all `onOracleResult` does (about 120k-141k
+   gas, measured; the Intake grants 200,000).
+2. **Allocate fees** (`allocate(k)`, permissionless and idempotent; also run by the public `settle`
+   and by `finalize`): moves the 9% binary fees and the ticket split to the staking bucket, the
+   window's jackpot inflow (`jackpotInFlight`), the oracle reserve and TEAM, and emits
+   `FeesAllocated` and `MarketVoided`.
+
+Winner and refund entitlements are computed from the pools and the result, so `claim(k)`,
+`claimable` and `lossOf` are correct from the moment the result is recorded and do not depend on
+step 2. `windowInfo(k).feesAllocated` says whether step 2 has run.
 
 ## Jackpot
 
 `finalize(maxWindows)` is permissionless and advances `nextFinalizeWindow` strictly in index order.
-It stops at a window that is still open and not yet timed out, times out one that is, and passes
-an empty (never created) window once its timeout would have elapsed. For each window in order:
+It stops at a window that is still open and not yet timed out, times out one that is, and passes a
+window nobody created as soon as that window has started (from then on it can never be created and
+its pending deposits are frozen, so an empty quiet hour never delays later windows' jackpots or loss
+history). For each window in order:
 
 1. pot = carried seed + pending external deposits assigned to this window + (if settled) the
    window's 93% ticket contribution and its 2% binary fees;
@@ -77,10 +97,20 @@ an empty (never created) window once its timeout would have elapsed. For each wi
 to the pending bucket of the earliest not-started window, so they cannot change a prize already
 fixed. The jackpot is never read from the token balance; stray transfers are ignored.
 
+**Coverage note (design property of the brief's parameters).** A ticket covers
+`2 * floor(result / 200) + 1` consecutive results (21 at a result near 2100). One ticket per
+address is sybil-trivial and the 256-ticket cap is first come, so 256 tickets spaced 21 apart cover
+every awake result in roughly `[2000, 7375]` for 1,280 IMD, of which 1,190.4 IMD flows back into
+the pot. Such a sweep is profitable once the carried seed exceeds about 410 IMD (80% payout of seed
+plus own contribution), and it locks other players out of that window's tickets. The brief fixes
+the ticket price, the one-per-address rule, the 256 cap, the band and the 80% split, so the contract
+implements them as written; operators should expect the seed to be swept when it grows past that
+level, and may ask for a different ticket cap or payout rule in a later version.
+
 ## Oracle
 
 The attestation is the IMD v2 EIP-712 type (`OracleAttestation.sol`), domain
-`{"IdentityMD Oracle", "2", chainId 1, verifyingContract = HamsterHour}`. `settle(k, a, sig)` requires:
+`{"IdentityMD Oracle", "2", chainId 1, verifyingContract = HamsterHour}`. Recording a result requires:
 `a.questionHash == keccak256(questionDocument(k, a.fromBlock, a.toBlock))` (the canonical sorted-key
 document of `question(k)`, which names the six round ids, the genesis and the source), chain id 1,
 typed `uint256` answer of 32 bytes, `panelSize >= 5`, `agreed >= 4`, `agreed >= quorum`,
@@ -92,15 +122,37 @@ the window to its 48-hour timeout.
 
 **Paying from the reserve.** The IMD Intake sells `oracle.request` on Ethereum for 0.5 IMD, so the
 reserve pays requests directly and there is no settler reimbursement. `requestOracle(k)` (anyone,
-once per window, after the window ends) moves 0.5 IMD from `oracleReserve`, approves the Intake and
-calls `request("oracle.request@oracle-1", requestBody(k), (this, onOracleResult), IMD, 0.5e18)`.
-The control plane runs the panel and calls `onOracleResult(intakeRequestId, a, sig)`, accepted only
-from the Intake and only for a request this contract paid for; it then goes through the same checks
-as `settle`. The body was checked against the free `POST /requests/check` on 2026-10-19 with no
-blockers (the "not answerable" advisory was for rounds in the future). Anyone may also pay IMD
-off-chain and submit the public attestation through `settle`. An empty reserve only makes
-`requestOracle` revert; settlement, timeouts and claims never depend on it. `fundOracleReserve`
-is open to anyone, and 1% of fee-paying volume refills it.
+after the window ends, while it is settleable) moves 0.5 IMD from `oracleReserve`, approves the
+Intake and calls `requestWithFailure("oracle.request@oracle-1", requestBody(k),
+(this, onOracleResult), onOracleFailure, IMD, 0.5e18)`; on an Intake that does not offer
+`requestWithFailure` it falls back to `request` (same arguments, no failure hook), and the
+`OracleRequested` event says which (`withFailureHook`). The reserve pays only for windows that can
+produce fees (`hasFeePayingActivity(k)`: a two-sided binary market or at least one ticket), so a
+single refundable 0.5 IMD bet cannot drain it.
+
+The control plane calls back once with 200,000 gas:
+
+- `onOracleResult(intakeRequestId, a, sig)`: accepted only from the Intake and only for a request
+  this contract paid for; records the result (step 1 above) and clears the outstanding request.
+- `onOracleFailure(intakeRequestId, status, reason, agreed, answered, signature)`: status 1
+  (refused) or 2 (no result: the panel disagreed or the job was cancelled). Unsigned, so it only
+  clears the outstanding request and emits `OracleRequestFailed`; nothing moves.
+
+A paid request is **outstanding** (`oracleRequestPending(k)`) from `requestOracle` until it
+delivers, fails, or 86,400 s (the body's `validForSeconds`) have passed. While it is outstanding a
+second `requestOracle(k)` reverts `AlreadyRequested` and the public `settle(k, a, sig)` reverts
+`PaidRequestPending`, so the answer the contract paid for is the one that settles the window and a
+bettor's own attestation cannot pre-empt it. After a failure or the lapse, anyone may pay a new
+request from the reserve or submit a public attestation; a late delivery of a lapsed request is
+still accepted while the window is open. Timing: a request made at the exact end of a window may
+reach the panel before Squeekchain has published the last round as settled; the panel then ends
+without a result, the failure hook releases the window, and a new request can be paid. Keepers
+should wait a few minutes after `windowEnd(k)` before calling `requestOracle(k)`.
+
+The body was checked against the free `POST /requests/check` on 2026-10-19 with no blockers (the
+"not answerable" advisory was for rounds in the future). An empty reserve only makes
+`requestOracle` revert; recording results, fee allocation, timeouts and claims never depend on it.
+`fundOracleReserve` is open to anyone, and 1% of fee-paying volume refills it.
 
 ## Staking, tip jar and TEAM
 
@@ -113,42 +165,62 @@ is set once. TEAM's 1% accrues to `balances[TEAM]`. Every recipient pulls with `
 
 `lossOf(k, account) = max(0, binary paid - refund entitlement - payout entitlement)`, netted across
 OVER/UNDER and SNOOZE, EXACT excluded, computed from entitlements so it is identical before and
-after claims; zero while a window is open and zero after a timeout. At chronological finalization
-the contract stores `totalEligibleLoss[k]`, `cumulativeLossBefore[k]` and `cumulativeLossAfter[k]`
-and emits `LossHistory`.
+after claims; zero while a window is open and zero after a timeout.
 
-Deviation to note: the brief asks for no loops over users, but the sum of a netted `max(0, ·)`
-rule cannot be derived from pool totals (the design review says the same). The contract therefore
-caps distinct binary bettors at 256 per window and iterates that bounded list once at
-finalization, the same bound the brief sets for EXACT tickets. The fuzz test checks the stored
-total equals the sum of the per-account rule.
+At chronological finalization the contract stores `totalEligibleLoss[k]`, `cumulativeLossBefore[k]`
+and `cumulativeLossAfter[k]` and emits `LossHistory`. `totalEligibleLoss[k]` is computed at pool
+level with no loop over users: for each non-void binary market, the losing side's whole stake plus
+the winning side's shortfall when the 9% fee leaves it less than its stake (a market where the
+losers hold under about 9.9% of the winners' stake). Properties, tested:
+
+- it equals the sum of `lossOf` over all accounts whenever no account holds more than one side in
+  the window (the normal case);
+- an account that hedges within itself nets its own loss (`lossOf` is per account), so the sum of
+  `lossOf` is at most `totalEligibleLoss[k]` plus rounding dust (under one wei per winning side
+  per account). A vault paying `reward * lossOf / totalEligibleLoss` therefore never over-distributes.
 
 ## Claims and conservation
 
 `claim(k)` pays the caller's winnings, refunds and jackpot share for window `k`, never expires and
 can be called again after the window's jackpot is finalized. Every incoming unit is assigned to a
 bucket: `windowFunds[k]` (pools until paid or allocated), pull balances, `pendingStakingFees`,
-`pendingTips`, `jackpotSeed`, `pendingJackpotDeposits`, `jackpotOutstanding` and `oracleReserve`.
-Pro-rata floor division leaves at most one unit per payout in `windowFunds[k]` forever; the invariant
+`pendingTips`, `jackpotSeed`, `pendingJackpotDeposits` (summed in `totalPendingJackpotDeposits`),
+`jackpotInFlight` (settled windows' jackpot inflow until finalized), `jackpotOutstanding` and
+`oracleReserve`. `trackedLiabilities()` is the sum of every bucket except `windowFunds[k]`, so
+`IMD.balanceOf(game) == trackedLiabilities() + sum of windowFunds` up to stray transfers. Pro-rata
+floor division leaves at most one unit per payout in `windowFunds[k]` forever; the invariant
 "IMD held >= all liabilities" is fuzzed in `test/Conservation.t.sol`. Reentrancy is guarded.
 
 ## After launch
 
-| Setting | Calls (TEAM only, 12 h between schedule and execute) | Value |
+| Setting | Calls (TEAM only) | Value |
 | --- | --- | --- |
-| Line | `scheduleLine(v)` then `executeLine(v)` | new OVER/UNDER line for later windows |
-| Staking recipient, once | `scheduleStakingRecipient(a)` then `executeStakingRecipient(a)` | the deployed MiningVault (or an interim recipient) from its own deployment record |
-| Tip jar, once | `scheduleTipRecipient(a)` then `executeTipRecipient(a)` | Squeektoshi's wallet |
+| Line | `scheduleLine(v)` | new OVER/UNDER line; ready 12 h later, applies from `nextLineFrom` |
+| Staking recipient, once | `scheduleStakingRecipient(a)` then `executeStakingRecipient(a)` after 12 h | the deployed MiningVault (or an interim recipient) from its own deployment record |
+| Tip jar, once | `scheduleTipRecipient(a)` then `executeTipRecipient(a)` after 12 h | Squeektoshi's wallet |
+
+**Line changes.** `scheduleLine(v)` emits `LineScheduled(v, readyAt, fromWindow)` with
+`readyAt = now + 12h` and `fromWindow` the first window that starts after `readyAt + 24h`, i.e. the
+first window that cannot be bet on before the change is ready. `lineFor(k)` and `windowInfo(k).line`
+show `v` for every `k >= fromWindow` from the moment of scheduling, and the old line below it, so
+the line a bettor reads for any window they can bet on is the line that window gets. A schedule
+that is not yet ready may be overwritten (it affects no bettable window); once ready it is locked
+until every window below `fromWindow` has closed (24 h), after which `LineApplied` is emitted and a
+new change may be scheduled. `line()` is the line in force for the next window to start.
 
 Operational responsibilities: keep `oracleReserve` funded (24 settlements/day cost 12 IMD/day at
-the current 0.5 IMD price), call `requestOracle(k)` after each window ends and `finalize(n)`
-regularly, and watch `SettingScheduled` events. Nobody has to run a keeper for users to recover
-timeout refunds. Tests are not an audit; an independent adversarial review is still required.
+the current 0.5 IMD price, only for windows with fee-paying activity), call `requestOracle(k)` a
+few minutes after each window ends, call `allocate(k)` or `finalize(n)` regularly (fees reach
+stakers, the reserve and TEAM at allocation; jackpots and loss history at finalization), and watch
+`LineScheduled`, `SettingScheduled` and `OracleRequestFailed` events. Nobody has to run a keeper
+for users to recover timeout refunds. Tests are not an audit; an independent adversarial review is
+still required.
 
 ## Chosen values not fixed by the brief
 
-`OPEN_AHEAD` 24 h, `ISSUED_AT_TOLERANCE` 300 s, `MAX_GUESS` `2^64 - 1`, `MAX_BINARY_BETTORS` 256,
-source `https://sepolia.squeekchain.com` (as v1 and the live site), Intake body
+`OPEN_AHEAD` 24 h, `ISSUED_AT_TOLERANCE` 300 s, `MAX_GUESS` `2^64 - 1`, `ORACLE_REQUEST_VALIDITY`
+86,400 s (equal to the body's `validForSeconds`), source `https://sepolia.squeekchain.com` (as v1
+and the live site), Intake body
 `{"window":{"hours":24},"panelSize":5,"quorum":4,"validForSeconds":86400}`, pool cap `uint128`.
 
 ## Trust assumptions
@@ -157,5 +229,10 @@ source `https://sepolia.squeekchain.com` (as v1 and the live site), Intake body
   covers absence. The attester is immutable: if IMD rotates it, a new deployment is needed and open
   windows refund at their timeout.
 - The Intake address is immutable; if IMD moves it, requests can still be paid off-chain and
-  settled through `settle`.
+  settled through `settle`. While a reserve-paid request is outstanding (at most 24 h), the public
+  path waits for it; a window therefore always has at least 24 h of public settlement before its
+  48 h timeout.
+- If the attester ever signs two different answers to one question, the first valid one to reach
+  the contract through the allowed path is final; the Intake-paid path has priority while it is
+  outstanding, nothing more.
 - TEAM's one-time staking recipient choice decides where the 5% share goes.

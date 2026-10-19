@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import {OracleAttestation} from "./OracleAttestation.sol";
-import {IIntake, IERC20} from "./interfaces/IIntake.sol";
+import {IIntake, IIntakeWithFailure, IERC20} from "./interfaces/IIntake.sol";
 
 /// @title Hamster Hour v2
 /// @notice Pari-mutuel IMD betting on the Squeekchain hamster wheel. No owner, pause, upgrade or
@@ -26,11 +26,13 @@ contract HamsterHour {
     uint256 public constant MIN_BET = 0.5 ether;
     uint256 public constant TICKET_PRICE = 5 ether;
     uint256 public constant MAX_TICKETS = 256;
-    uint256 public constant MAX_BINARY_BETTORS = 256;
     uint256 public constant MAX_GUESS = type(uint64).max;
     uint256 public constant SNOOZE_THRESHOLD = 100;
     uint256 public constant INITIAL_LINE = 2100;
     uint256 public constant ORACLE_PRICE = 0.5 ether;
+    /// @notice validForSeconds of the request body: a paid request that neither delivered nor
+    /// failed within it is treated as lost, and a new one may be paid.
+    uint64 public constant ORACLE_REQUEST_VALIDITY = 86400;
     uint16 public constant MIN_PANEL = 5;
     uint16 public constant MIN_AGREED = 4;
     uint64 public constant ISSUED_AT_TOLERANCE = 5 minutes;
@@ -49,7 +51,6 @@ contract HamsterHour {
     uint256 public constant JACKPOT_PAYOUT_PCT = 80;
     uint256 public constant FEED_TIP_PCT = 10;
 
-    bytes32 public constant SETTING_LINE = keccak256("line");
     bytes32 public constant SETTING_STAKING = keccak256("stakingRecipient");
     bytes32 public constant SETTING_TIP = keccak256("tipRecipient");
 
@@ -68,8 +69,7 @@ contract HamsterHour {
 
     struct Window {
         Status status;
-        bool ouVoid;
-        bool snVoid;
+        bool allocated;
         bool finalized;
         uint32 tickets;
         uint32 jackpotWinners;
@@ -81,8 +81,6 @@ contract HamsterHour {
         uint128 no;
         uint256 line;
         uint256 result;
-        uint256 ouWinnerPool;
-        uint256 snWinnerPool;
         uint256 jackpotFees;
         uint256 jackpotContribution;
         uint256 jackpotShare;
@@ -97,7 +95,6 @@ contract HamsterHour {
         uint128 no;
         uint64 guess;
         bool hasTicket;
-        bool registered;
         bool jackpotPaid;
         uint256 paid;
     }
@@ -118,12 +115,15 @@ contract HamsterHour {
         uint256 tickets;
         bool ouVoid;
         bool snVoid;
+        bool feesAllocated;
         bool jackpotFinalized;
         uint256 jackpotPot;
         uint256 jackpotWinners;
         uint256 jackpotShare;
         uint256 pendingJackpotDeposits;
         bool oracleRequested;
+        bool oracleRequestPending;
+        bytes32 intakeRequestId;
         bytes32 requestId;
     }
 
@@ -135,17 +135,24 @@ contract HamsterHour {
     // ----------------------------------------------------------------- storage
     mapping(uint256 => Window) internal _windows;
     mapping(uint256 => mapping(address => Position)) internal _positions;
-    mapping(uint256 => address[]) internal _bettors;
     mapping(uint256 => uint64[]) internal _guesses;
     mapping(uint256 => uint256) public windowFunds;
     mapping(uint256 => uint256) public pendingJackpotDeposits;
-    mapping(uint256 => bool) public oracleRequested;
+    /// @notice When the latest reserve-paid request for a window was made; zero if never.
+    mapping(uint256 => uint64) public oracleRequestedAt;
+    /// @notice The Intake id of the latest reserve-paid request that has neither delivered nor failed.
+    mapping(uint256 => bytes32) public pendingIntakeRequest;
     mapping(bytes32 => uint256) internal _intakeWindow;
     mapping(bytes32 => bool) public consumedRequest;
     mapping(bytes32 => Pending) public pendingSetting;
     mapping(address => uint256) public balances;
 
-    uint256 public line = INITIAL_LINE;
+    uint256 internal _line = INITIAL_LINE;
+    /// @notice A scheduled line change: applies to every window from `nextLineFrom` on, none of
+    /// which can be bet on before `nextLineReadyAt`. Zero when nothing is scheduled.
+    uint256 public nextLine;
+    uint64 public nextLineReadyAt;
+    uint256 public nextLineFrom;
     address public stakingRecipient;
     address public tipRecipient;
     uint256 public pendingStakingFees;
@@ -153,6 +160,10 @@ contract HamsterHour {
     uint256 public oracleReserve;
     uint256 public jackpotSeed;
     uint256 public jackpotOutstanding;
+    /// @notice Sum of every `pendingJackpotDeposits[k]` not yet finalized.
+    uint256 public totalPendingJackpotDeposits;
+    /// @notice Ticket contributions and 2% binary fees of settled windows not yet finalized.
+    uint256 public jackpotInFlight;
     uint256 public nextFinalizeWindow;
     uint256 public cumulativeLoss;
     mapping(uint256 => uint256) public totalEligibleLoss;
@@ -173,7 +184,6 @@ contract HamsterHour {
     error InvalidGuess();
     error DuplicateTicket();
     error TicketsFull();
-    error TooManyBettors();
     error NotSettleable();
     error NotTimedOut();
     error NotFinal();
@@ -189,9 +199,12 @@ contract HamsterHour {
     error NotIntake();
     error UnknownRequest();
     error AlreadyRequested();
+    error PaidRequestPending();
+    error NoFeePayingActivity();
     error ReserveTooLow();
     error InvalidAmount();
     error InvalidLine();
+    error LineChangeInProgress();
     error AlreadySet();
     error TimelockNotReady();
     error NothingScheduled();
@@ -211,7 +224,10 @@ contract HamsterHour {
     event Fed(address indexed from, uint256 amount);
     event JackpotDeposited(address indexed from, uint256 indexed k, uint256 amount);
     event OracleFunded(address indexed from, uint256 amount);
-    event OracleRequested(uint256 indexed k, bytes32 indexed intakeRequestId, uint256 price);
+    event OracleRequested(uint256 indexed k, bytes32 indexed intakeRequestId, uint256 price, bool withFailureHook);
+    event OracleRequestFailed(uint256 indexed k, bytes32 indexed intakeRequestId, uint8 status, bytes32 reason);
+    event LineScheduled(uint256 line, uint64 readyAt, uint256 fromWindow);
+    event LineApplied(uint256 line, uint256 fromWindow);
     event SettingScheduled(bytes32 indexed setting, bytes value, uint64 readyAt);
     event SettingExecuted(bytes32 indexed setting, bytes value);
 
@@ -266,7 +282,7 @@ contract HamsterHour {
     /// @notice OVER (side = true) or UNDER (side = false) the window's line. Market id 0.
     function betOverUnder(uint256 k, bool over, uint256 amount) external nonReentrant {
         Window storage w = _openForBet(k, amount);
-        Position storage p = _register(k, w);
+        Position storage p = _positions[k][msg.sender];
         if (over) {
             w.over = _add(w.over, amount);
             p.over = _add(p.over, amount);
@@ -282,7 +298,7 @@ contract HamsterHour {
     /// @notice SNOOZE YES (side = true: result below 100) or NO. Market id 1.
     function betSnooze(uint256 k, bool yes, uint256 amount) external nonReentrant {
         Window storage w = _openForBet(k, amount);
-        Position storage p = _register(k, w);
+        Position storage p = _positions[k][msg.sender];
         if (yes) {
             w.yes = _add(w.yes, amount);
             p.yes = _add(p.yes, amount);
@@ -316,20 +332,12 @@ contract HamsterHour {
         if (!isBettingOpen(k)) revert BettingClosed();
         w = _windows[k];
         if (w.status == Status.None) {
+            uint256 windowLine = lineFor(k);
             w.status = Status.Open;
             w.startsAt = windowStart(k);
             w.endsAt = windowEnd(k);
-            w.line = line;
-            emit WindowCreated(k, w.startsAt, w.endsAt, w.line);
-        }
-    }
-
-    function _register(uint256 k, Window storage) private returns (Position storage p) {
-        p = _positions[k][msg.sender];
-        if (!p.registered) {
-            if (_bettors[k].length >= MAX_BINARY_BETTORS) revert TooManyBettors();
-            p.registered = true;
-            _bettors[k].push(msg.sender);
+            w.line = windowLine;
+            emit WindowCreated(k, w.startsAt, w.endsAt, windowLine);
         }
     }
 
@@ -398,51 +406,111 @@ contract HamsterHour {
         return a.digest(block.chainid, address(this));
     }
 
-    /// @notice Pays 0.5 IMD from the oracle reserve to the Intake for window `k`'s question, once.
-    /// The signed answer comes back through `onOracleResult`. Anyone may call after the window ends.
+    /// @notice True while a reserve-paid request for `k` is outstanding: made, neither delivered nor
+    /// failed, and younger than its validity. Public `settle` waits for it; `requestOracle` refuses
+    /// a second payment while it lasts.
+    function oracleRequestPending(uint256 k) public view returns (bool) {
+        return pendingIntakeRequest[k] != bytes32(0) && block.timestamp < oracleRequestedAt[k] + ORACLE_REQUEST_VALIDITY;
+    }
+
+    /// @notice True when window `k` can produce fees that refill the reserve: a two-sided binary
+    /// market or at least one EXACT ticket. The reserve pays for no other window.
+    function hasFeePayingActivity(uint256 k) public view returns (bool) {
+        Window storage w = _windows[k];
+        return (w.over > 0 && w.under > 0) || (w.yes > 0 && w.no > 0) || w.tickets > 0;
+    }
+
+    /// @notice Pays 0.5 IMD from the oracle reserve to the Intake for window `k`'s question. Anyone
+    /// may call once the window has ended while it is settleable, once per outstanding request: a
+    /// request that failed or lapsed (validity) may be replaced. The signed answer comes back
+    /// through `onOracleResult`, a refusal or an empty panel through `onOracleFailure`.
     function requestOracle(uint256 k) external nonReentrant returns (bytes32 intakeRequestId) {
         Window storage w = _windows[k];
         if (w.status != Status.Open || block.timestamp < w.endsAt || block.timestamp >= w.endsAt + TIMEOUT) {
             revert NotSettleable();
         }
-        if (oracleRequested[k]) revert AlreadyRequested();
+        if (!hasFeePayingActivity(k)) revert NoFeePayingActivity();
+        if (oracleRequestPending(k)) revert AlreadyRequested();
         if (oracleReserve < ORACLE_PRICE) revert ReserveTooLow();
-        oracleRequested[k] = true;
         oracleReserve -= ORACLE_PRICE;
+        oracleRequestedAt[k] = uint64(block.timestamp);
         if (!IERC20(IMD).approve(INTAKE, ORACLE_PRICE)) revert TransferFailed();
-        intakeRequestId = IIntake(INTAKE)
-            .request(
-                ORACLE_ACTION,
-                bytes(requestBody(k)),
-                IIntake.Callback(address(this), this.onOracleResult.selector),
-                IMD,
-                ORACLE_PRICE
-            );
+        bool withFailureHook;
+        (intakeRequestId, withFailureHook) = _requestFromIntake(bytes(requestBody(k)));
+        pendingIntakeRequest[k] = intakeRequestId;
         _intakeWindow[intakeRequestId] = k + 1;
-        emit OracleRequested(k, intakeRequestId, ORACLE_PRICE);
+        emit OracleRequested(k, intakeRequestId, ORACLE_PRICE, withFailureHook);
     }
 
-    /// @notice Intake callback with the signed answer to a request this contract paid for.
+    /// @dev Prefers the variant with a failure hook; falls back to the plain `request` on an Intake
+    /// that does not offer it, so the reserve can still buy answers there (without failure calls).
+    function _requestFromIntake(bytes memory body) private returns (bytes32 intakeRequestId, bool withFailureHook) {
+        IIntake.Callback memory callback = IIntake.Callback(address(this), this.onOracleResult.selector);
+        (bool ok, bytes memory ret) = INTAKE.call(
+            abi.encodeCall(
+                IIntakeWithFailure.requestWithFailure,
+                (ORACLE_ACTION, body, callback, this.onOracleFailure.selector, IMD, ORACLE_PRICE)
+            )
+        );
+        if (ok) return (abi.decode(ret, (bytes32)), true);
+        intakeRequestId = IIntake(INTAKE).request(ORACLE_ACTION, body, callback, IMD, ORACLE_PRICE);
+    }
+
+    /// @notice Intake callback with the signed answer to a request this contract paid for. Kept
+    /// within the Intake's 200,000 gas stipend: it verifies and records the result only; fees are
+    /// allocated later by `allocate(k)` or `finalize`. Claims never wait for that.
     function onOracleResult(bytes32 intakeRequestId, OracleAttestation.Attestation calldata a, bytes calldata signature)
         external
-        nonReentrant
     {
+        uint256 k = _takeIntakeRequest(intakeRequestId);
+        _recordResult(k, _windows[k], a, signature);
+    }
+
+    /// @notice Intake failure hook: refused (status 1) or no result (status 2). Unsigned, so it only
+    /// releases the window for a new reserve-paid request or a public `settle`; nothing moves.
+    function onOracleFailure(bytes32 intakeRequestId, uint8 status, bytes32 reason, uint16, uint16, bytes calldata)
+        external
+    {
+        uint256 k = _takeIntakeRequest(intakeRequestId);
+        emit OracleRequestFailed(k, intakeRequestId, status, reason);
+    }
+
+    function _takeIntakeRequest(bytes32 intakeRequestId) private returns (uint256 k) {
         if (msg.sender != INTAKE) revert NotIntake();
         uint256 k1 = _intakeWindow[intakeRequestId];
         if (k1 == 0) revert UnknownRequest();
-        _settle(k1 - 1, a, signature);
+        delete _intakeWindow[intakeRequestId];
+        k = k1 - 1;
+        if (pendingIntakeRequest[k] == intakeRequestId) delete pendingIntakeRequest[k];
     }
 
-    /// @notice Settles window `k` from an attestation anyone fetched from the IMD API.
+    /// @notice Settles window `k` from an attestation anyone fetched from the IMD API, and allocates
+    /// its fees. Refused while a reserve-paid request for `k` is outstanding, so the answer the
+    /// contract paid for is the one that settles it.
     function settle(uint256 k, OracleAttestation.Attestation calldata a, bytes calldata signature)
         external
         nonReentrant
     {
-        _settle(k, a, signature);
+        if (oracleRequestPending(k)) revert PaidRequestPending();
+        Window storage w = _windows[k];
+        _recordResult(k, w, a, signature);
+        _allocate(k, w);
     }
 
-    function _settle(uint256 k, OracleAttestation.Attestation calldata a, bytes calldata signature) private {
+    /// @notice Moves a settled window's fees to stakers, jackpot, reserve and TEAM. Permissionless,
+    /// once per window; `finalize` runs it too. Claims do not depend on it.
+    function allocate(uint256 k) external {
         Window storage w = _windows[k];
+        if (w.status != Status.Settled) revert NotFinal();
+        _allocate(k, w);
+    }
+
+    function _recordResult(
+        uint256 k,
+        Window storage w,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata signature
+    ) private {
         if (w.status != Status.Open || block.timestamp < w.endsAt || block.timestamp >= w.endsAt + TIMEOUT) {
             revert NotSettleable();
         }
@@ -465,43 +533,35 @@ contract HamsterHour {
         w.result = result;
         w.requestId = a.requestId;
         emit Settled(k, result, a.requestId, msg.sender);
+    }
 
+    function _allocate(uint256 k, Window storage w) private {
+        if (w.allocated) return;
+        w.allocated = true;
         uint256 stakers;
         uint256 jackpot;
         uint256 oracle;
         uint256 team;
 
         // OVER/UNDER: refunded fully when asleep or one-sided.
-        if (result < SNOOZE_THRESHOLD || w.over == 0 || w.under == 0) {
-            w.ouVoid = true;
+        if (_ouVoid(w)) {
             emit MarketVoided(k, 0);
         } else {
             uint256 pool = uint256(w.over) + w.under;
-            uint256 s = pool * BINARY_STAKERS_PCT / 100;
-            uint256 j = pool * BINARY_JACKPOT_PCT / 100;
-            uint256 o = pool * BINARY_ORACLE_PCT / 100;
-            uint256 t = pool * BINARY_TEAM_PCT / 100;
-            w.ouWinnerPool = pool - s - j - o - t;
-            stakers += s;
-            jackpot += j;
-            oracle += o;
-            team += t;
+            stakers += pool * BINARY_STAKERS_PCT / 100;
+            jackpot += pool * BINARY_JACKPOT_PCT / 100;
+            oracle += pool * BINARY_ORACLE_PCT / 100;
+            team += pool * BINARY_TEAM_PCT / 100;
         }
         // SNOOZE: refunded fully when one-sided.
-        if (w.yes == 0 || w.no == 0) {
-            w.snVoid = true;
+        if (_snVoid(w)) {
             emit MarketVoided(k, 1);
         } else {
             uint256 pool = uint256(w.yes) + w.no;
-            uint256 s = pool * BINARY_STAKERS_PCT / 100;
-            uint256 j = pool * BINARY_JACKPOT_PCT / 100;
-            uint256 o = pool * BINARY_ORACLE_PCT / 100;
-            uint256 t = pool * BINARY_TEAM_PCT / 100;
-            w.snWinnerPool = pool - s - j - o - t;
-            stakers += s;
-            jackpot += j;
-            oracle += o;
-            team += t;
+            stakers += pool * BINARY_STAKERS_PCT / 100;
+            jackpot += pool * BINARY_JACKPOT_PCT / 100;
+            oracle += pool * BINARY_ORACLE_PCT / 100;
+            team += pool * BINARY_TEAM_PCT / 100;
         }
         // EXACT tickets: 93% to this window's jackpot contribution, fees on the rest.
         if (w.tickets > 0) {
@@ -515,6 +575,7 @@ contract HamsterHour {
             team += t;
         }
         w.jackpotFees = jackpot;
+        jackpotInFlight += jackpot + w.jackpotContribution;
         windowFunds[k] -= stakers + jackpot + oracle + team + w.jackpotContribution;
         _creditStakers(stakers);
         oracleReserve += oracle;
@@ -537,7 +598,8 @@ contract HamsterHour {
 
     // ----------------------------------------------------------------- jackpot
     /// @notice Finalizes jackpot accounting and loss history strictly in window order, up to
-    /// `maxWindows` windows. Stops at a window that is still open and not yet timed out.
+    /// `maxWindows` windows. Stops at a window that is still open and not yet timed out, and at a
+    /// window nobody created until it has started (from then on it can never be created).
     function finalize(uint256 maxWindows) external {
         uint256 k = nextFinalizeWindow;
         for (uint256 i; i < maxWindows; ++i) {
@@ -546,7 +608,7 @@ contract HamsterHour {
                 if (block.timestamp < w.endsAt + TIMEOUT) break;
                 _timeout(k);
             } else if (w.status == Status.None) {
-                if (block.timestamp < windowEnd(k) + TIMEOUT) break;
+                if (block.timestamp < windowStart(k)) break;
             }
             _finalizeOne(k, w);
             unchecked {
@@ -557,13 +619,18 @@ contract HamsterHour {
     }
 
     function _finalizeOne(uint256 k, Window storage w) private {
-        uint256 pot = jackpotSeed + pendingJackpotDeposits[k];
+        uint256 deposits = pendingJackpotDeposits[k];
+        uint256 pot = jackpotSeed + deposits;
         pendingJackpotDeposits[k] = 0;
+        totalPendingJackpotDeposits -= deposits;
         uint256 winners;
         uint256 share;
         uint256 eligibleLoss;
         if (w.status == Status.Settled) {
-            pot += w.jackpotContribution + w.jackpotFees;
+            _allocate(k, w);
+            uint256 inflow = w.jackpotContribution + w.jackpotFees;
+            pot += inflow;
+            jackpotInFlight -= inflow;
             if (w.result >= SNOOZE_THRESHOLD) {
                 uint64[] storage guesses = _guesses[k];
                 uint256 n = guesses.length;
@@ -577,7 +644,7 @@ contract HamsterHour {
                 w.jackpotShare = share;
                 jackpotOutstanding += share * winners;
             }
-            eligibleLoss = _sumEligibleLoss(k, w);
+            eligibleLoss = _poolLoss(w);
         }
         w.jackpotPot = pot;
         w.finalized = true;
@@ -590,12 +657,23 @@ contract HamsterHour {
         emit LossHistory(k, eligibleLoss, cumulativeLossBefore[k], cumulativeLoss);
     }
 
-    function _sumEligibleLoss(uint256 k, Window storage w) private view returns (uint256 total) {
-        address[] storage bettors = _bettors[k];
-        uint256 n = bettors.length;
-        for (uint256 i; i < n; ++i) {
-            total += _loss(w, _positions[k][bettors[i]]);
+    /// @dev Pool-level netted loss of a settled window, with no loop over users: each losing side
+    /// in full, plus a winning side's shortfall when the fee leaves it less than its stake.
+    function _poolLoss(Window storage w) private view returns (uint256 total) {
+        if (!_ouVoid(w)) {
+            (uint256 win, uint256 lose) =
+                w.result > w.line ? (uint256(w.over), uint256(w.under)) : (uint256(w.under), uint256(w.over));
+            total += lose + _shortfall(win, _winnerPool(win + lose));
         }
+        if (!_snVoid(w)) {
+            (uint256 win, uint256 lose) =
+                w.result < SNOOZE_THRESHOLD ? (uint256(w.yes), uint256(w.no)) : (uint256(w.no), uint256(w.yes));
+            total += lose + _shortfall(win, _winnerPool(win + lose));
+        }
+    }
+
+    function _shortfall(uint256 stake, uint256 payout) private pure returns (uint256) {
+        return stake > payout ? stake - payout : 0;
     }
 
     /// @notice Wins iff |guess - result| * 1000 <= result * 5, evaluated without overflow.
@@ -627,6 +705,7 @@ contract HamsterHour {
     function _depositJackpot(uint256 amount) private {
         uint256 k = earliestNotStartedWindow();
         pendingJackpotDeposits[k] += amount;
+        totalPendingJackpotDeposits += amount;
         emit JackpotDeposited(msg.sender, k, amount);
     }
 
@@ -685,20 +764,36 @@ contract HamsterHour {
         }
     }
 
+    /// @dev Valid once settled: OVER/UNDER is void when asleep or one-sided.
+    function _ouVoid(Window storage w) private view returns (bool) {
+        return w.result < SNOOZE_THRESHOLD || w.over == 0 || w.under == 0;
+    }
+
+    /// @dev SNOOZE is void when one-sided.
+    function _snVoid(Window storage w) private view returns (bool) {
+        return w.yes == 0 || w.no == 0;
+    }
+
+    /// @notice What a two-sided binary pool pays its winners: the pool less the 9% of fees.
+    function _winnerPool(uint256 pool) private pure returns (uint256) {
+        return pool - pool * BINARY_STAKERS_PCT / 100 - pool * BINARY_JACKPOT_PCT / 100 - pool * BINARY_ORACLE_PCT / 100
+            - pool * BINARY_TEAM_PCT / 100;
+    }
+
     function _binaryEntitlement(Window storage w, Position storage p) private view returns (uint256 amount) {
-        if (w.ouVoid) {
+        if (_ouVoid(w)) {
             amount = uint256(p.over) + p.under;
-        } else if (w.result > w.line) {
-            amount = uint256(p.over) * w.ouWinnerPool / w.over;
         } else {
-            amount = uint256(p.under) * w.ouWinnerPool / w.under;
+            uint256 winners = _winnerPool(uint256(w.over) + w.under);
+            if (w.result > w.line) amount = uint256(p.over) * winners / w.over;
+            else amount = uint256(p.under) * winners / w.under;
         }
-        if (w.snVoid) {
+        if (_snVoid(w)) {
             amount += uint256(p.yes) + p.no;
-        } else if (w.result < SNOOZE_THRESHOLD) {
-            amount += uint256(p.yes) * w.snWinnerPool / w.yes;
         } else {
-            amount += uint256(p.no) * w.snWinnerPool / w.no;
+            uint256 winners = _winnerPool(uint256(w.yes) + w.no);
+            if (w.result < SNOOZE_THRESHOLD) amount += uint256(p.yes) * winners / w.yes;
+            else amount += uint256(p.no) * winners / w.no;
         }
     }
 
@@ -730,12 +825,22 @@ contract HamsterHour {
         return _positions[k][account];
     }
 
-    function bettorCount(uint256 k) external view returns (uint256) {
-        return _bettors[k].length;
-    }
-
     function guessAt(uint256 k, uint256 i) external view returns (uint256) {
         return _guesses[k][i];
+    }
+
+    /// @notice The OVER/UNDER line in force for new windows right now.
+    function line() external view returns (uint256) {
+        return lineFor(earliestNotStartedWindow());
+    }
+
+    /// @notice The line window `k` has, or will be created with. Fixed for every window from the
+    /// moment it can be bet on: a scheduled change only reaches windows that open after it is ready.
+    function lineFor(uint256 k) public view returns (uint256) {
+        Window storage w = _windows[k];
+        if (w.status != Status.None) return w.line;
+        if (nextLine != 0 && k >= nextLineFrom) return nextLine;
+        return _line;
     }
 
     /// @notice One view per window for the site and agents.
@@ -747,28 +852,33 @@ contract HamsterHour {
         v.endsAt = windowEnd(k);
         v.closesAt = v.startsAt;
         v.timeoutAt = v.endsAt + TIMEOUT;
-        v.line = w.status == Status.None ? line : w.line;
+        v.line = lineFor(k);
         v.result = w.result;
         v.over = w.over;
         v.under = w.under;
         v.yes = w.yes;
         v.no = w.no;
         v.tickets = w.tickets;
-        v.ouVoid = w.ouVoid;
-        v.snVoid = w.snVoid;
+        v.ouVoid = w.status == Status.Settled && _ouVoid(w);
+        v.snVoid = w.status == Status.Settled && _snVoid(w);
+        v.feesAllocated = w.allocated;
         v.jackpotFinalized = w.finalized;
         v.jackpotPot = w.jackpotPot;
         v.jackpotWinners = w.jackpotWinners;
         v.jackpotShare = w.jackpotShare;
         v.pendingJackpotDeposits = pendingJackpotDeposits[k];
-        v.oracleRequested = oracleRequested[k];
+        v.oracleRequested = oracleRequestedAt[k] != 0;
+        v.oracleRequestPending = oracleRequestPending(k);
+        v.intakeRequestId = pendingIntakeRequest[k];
         v.requestId = w.requestId;
     }
 
-    /// @notice Sum of every IMD liability the contract tracks, excluding per-window funds, which are
-    /// read with `windowFunds(k)`.
+    /// @notice Sum of every IMD liability the contract tracks outside per-window funds (read with
+    /// `windowFunds(k)`): pull balances, jackpot seed, fixed jackpot shares, jackpot money of settled
+    /// windows awaiting finalization, pending external deposits, the oracle reserve and held fees.
     function trackedLiabilities() external view returns (uint256) {
-        return _sumBalancesLess() + jackpotSeed + jackpotOutstanding + oracleReserve + pendingStakingFees + pendingTips;
+        return _sumBalancesLess() + jackpotSeed + jackpotOutstanding + jackpotInFlight + totalPendingJackpotDeposits
+            + oracleReserve + pendingStakingFees + pendingTips;
     }
 
     function _sumBalancesLess() private view returns (uint256 total) {
@@ -780,15 +890,35 @@ contract HamsterHour {
     }
 
     // ----------------------------------------------------------------- TEAM settings (12h timelock)
+    /// @notice Schedules a new line. It is ready 12 hours later and applies to every window from
+    /// `nextLineFrom` on, the first window that cannot be bet on before it is ready, so no window
+    /// changes its line once it is open for bets. Overwriting an unready schedule is allowed; a
+    /// ready one is locked in until every window below `nextLineFrom` has closed (24 hours).
     function scheduleLine(uint256 newLine) external onlyTeam {
         if (newLine == 0) revert InvalidLine();
-        _schedule(SETTING_LINE, abi.encode(newLine));
+        _foldLine();
+        if (nextLine != 0 && block.timestamp >= nextLineReadyAt) revert LineChangeInProgress();
+        uint64 readyAt = uint64(block.timestamp) + TIMELOCK;
+        uint256 from = _firstWindowStartingAfter(readyAt + OPEN_AHEAD);
+        nextLine = newLine;
+        nextLineReadyAt = readyAt;
+        nextLineFrom = from;
+        emit LineScheduled(newLine, readyAt, from);
     }
 
-    /// @notice Applies only to windows created after execution; existing windows keep their snapshot.
-    function executeLine(uint256 newLine) external onlyTeam {
-        _execute(SETTING_LINE, abi.encode(newLine));
-        line = newLine;
+    /// @dev Once every window below `nextLineFrom` has closed, the scheduled line is the only line.
+    function _foldLine() private {
+        if (nextLine != 0 && block.timestamp >= uint256(nextLineReadyAt) + OPEN_AHEAD) {
+            _line = nextLine;
+            emit LineApplied(nextLine, nextLineFrom);
+            delete nextLine;
+            delete nextLineReadyAt;
+            delete nextLineFrom;
+        }
+    }
+
+    function _firstWindowStartingAfter(uint256 t) private pure returns (uint256) {
+        return t < GENESIS ? 0 : (t - GENESIS) / WINDOW_DURATION + 1;
     }
 
     function scheduleStakingRecipient(address recipient) external onlyTeam {

@@ -35,7 +35,9 @@ contract JackpotTest is GameTest {
         assertEq(game.windowInfo(0).jackpotShare, share0);
         assertEq(game.jackpotSeed(), pot0 - share0, "20% carries");
         game.finalize(10);
-        assertEq(game.nextFinalizeWindow(), 3);
+        // Window 3 (never created) has started by now, so it passes too; window 4 has not.
+        assertEq(game.nextFinalizeWindow(), 4);
+        assertEq(game.windowInfo(3).jackpotPot, game.jackpotSeed(), "an empty window carries the seed");
         // Window 1 asleep: everything carries. Window 2: carol takes 80% of the carried pot.
         uint256 pot1 = pot0 - share0 + c;
         assertEq(game.windowInfo(1).jackpotPot, pot1);
@@ -58,17 +60,53 @@ contract JackpotTest is GameTest {
         _ticket(alice, 1, 2000);
         vm.prank(keeper);
         game.depositJackpot(10 ether); // pending for window 0, never created
+        assertEq(game.totalPendingJackpotDeposits(), 10 ether);
+        assertEq(game.trackedLiabilities(), 10 ether, "pending deposits are a tracked liability");
+        vm.warp(GENESIS - 1);
+        game.finalize(10);
+        assertEq(game.nextFinalizeWindow(), 0, "window 0 can still be created before it starts");
+        vm.warp(GENESIS);
+        game.finalize(10);
+        assertEq(game.nextFinalizeWindow(), 1, "empty window 0 passes as soon as it has started");
+        assertEq(game.jackpotSeed(), 10 ether, "deposits for an empty window carry");
+        assertEq(game.totalPendingJackpotDeposits(), 0);
         vm.warp(game.windowEnd(1) + 48 hours - 1);
         game.finalize(10);
-        assertEq(game.nextFinalizeWindow(), 1, "empty window 0 passes once its timeout elapsed");
-        assertEq(game.jackpotSeed(), 10 ether, "deposits for an empty window carry");
+        assertEq(game.nextFinalizeWindow(), 1, "an open window waits for settle or timeout");
         vm.warp(game.windowEnd(1) + 48 hours);
         game.finalize(10);
         assertEq(uint8(game.windowInfo(1).status), uint8(HamsterHour.Status.TimedOut));
-        assertEq(game.nextFinalizeWindow(), 2);
+        assertEq(game.nextFinalizeWindow(), 11, "bounded catch-up: window 1 and nine started empty windows");
         assertEq(game.jackpotSeed(), 10 ether, "timeout leaves the seed unchanged");
         assertEq(_claim(alice, 1), TICKET, "timeout refunds the ticket in full");
         assertEq(game.totalEligibleLoss(1), 0);
+    }
+
+    function test_emptyWindowDoesNotStallLaterJackpots() public {
+        // Nobody bets on window 0; window 1 has a jackpot winner.
+        _ticket(alice, 1, 2000);
+        _ou(alice, 1, true, 1 ether);
+        _ou(bob, 1, false, 1 ether);
+        _settle(1, 2000);
+        game.finalize(10);
+        assertEq(game.nextFinalizeWindow(), 3, "window 1 is finalized right after its settlement (2 has started)");
+        assertEq(game.windowInfo(1).jackpotWinners, 1);
+        // 2000 <= 2100 is UNDER: alice's OVER loses and she holds the only winning ticket.
+        assertEq(game.claimable(1, alice), (TICKET * 93 / 100 + 2 ether * 2 / 100) * 80 / 100);
+        assertEq(game.claimable(1, bob), 2 ether * 91 / 100);
+        assertEq(game.totalEligibleLoss(1), 1 ether);
+    }
+
+    function test_jackpotInFlightIsTrackedBetweenSettleAndFinalize() public {
+        _ticket(alice, 0, 2000);
+        _settle(0, 2000);
+        uint256 contribution = TICKET * 93 / 100;
+        assertEq(game.jackpotInFlight(), contribution);
+        assertEq(game.windowFunds(0), 0);
+        assertEq(game.trackedLiabilities(), imd.balanceOf(address(game)), "every unit is in a view");
+        game.finalize(1);
+        assertEq(game.jackpotInFlight(), 0);
+        assertEq(game.jackpotOutstanding() + game.jackpotSeed(), contribution);
     }
 
     function test_jackpotIsNeverRawBalance() public {
@@ -111,31 +149,55 @@ contract JackpotTest is GameTest {
         assertEq(game.pendingJackpotDeposits(6), 1 ether);
     }
 
-    function test_timelocks() public {
+    function test_lineTimelockNeverChangesABettableWindow() public {
         vm.expectRevert(HamsterHour.NotTeam.selector);
         vm.prank(alice);
         game.scheduleLine(2500);
         vm.expectRevert(HamsterHour.InvalidLine.selector);
         vm.prank(team);
         game.scheduleLine(0);
+        // Now GENESIS - 1h: ready at GENESIS + 11h; the first window that cannot be bet on before
+        // then starts after GENESIS + 35h, i.e. window 36.
         vm.prank(team);
         game.scheduleLine(2500);
-        vm.warp(block.timestamp + 12 hours - 1);
-        vm.expectRevert(HamsterHour.TimelockNotReady.selector);
+        assertEq(game.nextLine(), 2500);
+        assertEq(game.nextLineReadyAt(), GENESIS + 11 * HOUR);
+        assertEq(game.nextLineFrom(), 36);
+        assertEq(game.lineFor(35), 2100);
+        assertEq(game.lineFor(36), 2500);
+        assertEq(game.windowInfo(36).line, 2500, "announced from scheduling");
+        assertEq(game.line(), 2100, "nothing bettable changes");
+        // An unready schedule may be overwritten: no bettable window is affected.
         vm.prank(team);
-        game.executeLine(2500);
-        vm.warp(block.timestamp + 1);
-        vm.expectRevert(HamsterHour.NothingScheduled.selector);
+        game.scheduleLine(2400);
+        assertEq(game.lineFor(36), 2400);
+        // Windows created before and after the change keep the line they showed.
+        _ou(alice, 0, true, 1 ether);
+        vm.warp(GENESIS + 12 * HOUR);
+        _ou(alice, 35, true, 1 ether);
+        _ou(alice, 36, true, 1 ether);
+        assertEq(game.windowInfo(0).line, 2100);
+        assertEq(game.windowInfo(35).line, 2100);
+        assertEq(game.windowInfo(36).line, 2400);
+        // While windows below 36 can still be bet on, another change must wait.
+        vm.expectRevert(HamsterHour.LineChangeInProgress.selector);
         vm.prank(team);
-        game.executeLine(2600);
+        game.scheduleLine(2600);
+        assertEq(game.line(), 2100, "window 12 is the next to start and keeps 2100");
+        // Once every window below 36 has closed the new line is the only line, and a new change
+        // can be scheduled (ready at +12h, from the first window starting after +36h).
+        vm.warp(GENESIS + 35 * HOUR);
+        assertEq(game.line(), 2400);
         vm.prank(team);
-        game.executeLine(2500);
-        assertEq(game.line(), 2500);
-        vm.expectRevert(HamsterHour.NothingScheduled.selector);
-        vm.prank(team);
-        game.executeLine(2500);
+        game.scheduleLine(2600);
+        assertEq(game.nextLineFrom(), 72);
+        assertEq(game.lineFor(71), 2400);
+        assertEq(game.lineFor(72), 2600);
+        assertEq(game.nextLine(), 2600);
+    }
 
-        // Staking recipient: once only; held fees move on set. (Now GENESIS + 11h: windows 12+ open.)
+    function test_recipientTimelocks() public {
+        // Staking recipient: once only; held fees move on set.
         _ou(alice, 12, true, 100 ether);
         _ou(bob, 12, false, 100 ether);
         _ou(alice, 13, true, 10 ether);

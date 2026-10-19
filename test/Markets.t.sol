@@ -31,13 +31,16 @@ contract MarketsTest is GameTest {
     function test_windowSnapshotsLineAtCreation() public {
         _ou(alice, 0, true, 1 ether);
         vm.prank(team);
-        game.scheduleLine(2500);
-        vm.warp(block.timestamp + 12 hours);
-        vm.prank(team);
-        game.executeLine(2500);
+        game.scheduleLine(2500); // ready GENESIS + 11h, applies from window 36
         _ou(alice, 13, true, 1 ether);
+        vm.warp(game.windowStart(36) - 24 hours);
+        _ou(alice, 36, true, 1 ether);
         assertEq(game.windowInfo(0).line, 2100);
-        assertEq(game.windowInfo(13).line, 2500);
+        assertEq(game.windowInfo(13).line, 2100, "window 13 could be bet on before the change was ready");
+        assertEq(game.windowInfo(36).line, 2500);
+        _settle(36, 2400);
+        assertEq(game.claimable(36, alice), 1 ether, "one-sided: refund at the snapshotted 2500 line");
+        assertTrue(game.windowInfo(36).ouVoid);
     }
 
     function test_overUnderOutcomesAtLine() public {
@@ -167,18 +170,45 @@ contract MarketsTest is GameTest {
         assertEq(game.lossOf(0, carol), 10 ether);
         assertEq(game.lossOf(0, bob), 0);
         // Stable across claims.
-        _claim(0 == 0 ? alice : bob, 0);
+        _claim(alice, 0);
         assertEq(game.lossOf(0, alice), 20 ether - noPayout);
         game.finalize(1);
-        assertEq(game.totalEligibleLoss(0), 20 ether - noPayout + 10 ether);
+        // The stored total is pool-level (no loop over users): each losing side in full. Alice's
+        // own netting is per account, so the sum of lossOf is at most the stored total.
+        assertEq(game.totalEligibleLoss(0), 20 ether);
+        assertGe(game.totalEligibleLoss(0), game.lossOf(0, alice) + game.lossOf(0, bob) + game.lossOf(0, carol));
         assertEq(game.cumulativeLossBefore(0), 0);
-        assertEq(game.cumulativeLossAfter(0), 20 ether - noPayout + 10 ether);
+        assertEq(game.cumulativeLossAfter(0), 20 ether);
         assertEq(game.lossOf(0, alice), 20 ether - noPayout, "stable after finalization");
         _settle(1, 2500);
         assertEq(game.lossOf(1, alice), 20 ether - 20 ether * 91 / 100);
         game.finalize(1);
-        assertEq(game.totalEligibleLoss(1), 20 ether - 20 ether * 91 / 100);
+        assertEq(game.totalEligibleLoss(1), 10 ether, "the losing UNDER side");
         assertEq(game.cumulativeLossBefore(1), game.cumulativeLossAfter(0));
+        assertEq(game.cumulativeLossAfter(1), 30 ether);
+    }
+
+    function test_lossTotalEqualsSumWithoutHedgingAndCountsWinnerShortfall() public {
+        // Window 0: plain bettors on both markets; the total is exactly the sum of lossOf.
+        _ou(alice, 0, true, 10 ether);
+        _ou(bob, 0, false, 30 ether);
+        _sn(carol, 0, true, 2 ether);
+        _sn(keeper, 0, false, 8 ether);
+        // Window 1: lopsided market where the fee leaves the winners short of their stake.
+        _ou(alice, 1, true, 1000 ether);
+        _ou(bob, 1, false, 1 ether);
+        _settle(0, 2500);
+        _settle(1, 2500);
+        game.finalize(2);
+        uint256 sum0 = game.lossOf(0, alice) + game.lossOf(0, bob) + game.lossOf(0, carol) + game.lossOf(0, keeper);
+        assertEq(sum0, 30 ether + 2 ether);
+        assertEq(game.totalEligibleLoss(0), sum0);
+        // Window 1: OVER wins 1001 * 0.91 = 910.91 on a 1000 stake: shortfall 89.09, plus bob's 1.
+        uint256 winnerPool = 1001 ether * 91 / 100;
+        assertEq(game.lossOf(1, alice), 1000 ether - winnerPool);
+        assertEq(game.lossOf(1, bob), 1 ether);
+        assertEq(game.totalEligibleLoss(1), 1 ether + 1000 ether - winnerPool);
+        assertEq(game.cumulativeLossAfter(1), sum0 + 1 ether + 1000 ether - winnerPool);
     }
 
     function test_exactTicketRules() public {
@@ -241,22 +271,30 @@ contract MarketsTest is GameTest {
         assertEq(game.jackpotSeed(), pot - 2 * share + TICKET * 93 / 100);
     }
 
-    function test_bettorCapAndViews() public {
-        for (uint256 i; i < 256; ++i) {
+    function test_noBettorCapAndViews() public {
+        // 300 throwaway wallets on one side cannot lock anyone out: there is no per-user list.
+        for (uint256 i; i < 300; ++i) {
             address who = address(uint160(0x20000 + i));
-            imd.mint(who, 1 ether);
+            imd.mint(who, 0.5 ether);
             vm.prank(who);
-            imd.approve(address(game), 1 ether);
-            _ou(who, 0, i % 2 == 0, 1 ether);
+            imd.approve(address(game), 0.5 ether);
+            _ou(who, 0, true, 0.5 ether);
         }
-        vm.expectRevert(HamsterHour.TooManyBettors.selector);
-        _ou(alice, 0, true, 1 ether);
+        _ou(alice, 0, false, 100 ether);
+        _sn(alice, 0, true, 1 ether);
         HamsterHour.WindowView memory v = game.windowInfo(0);
-        assertEq(v.over, 128 ether);
-        assertEq(v.under, 128 ether);
+        assertEq(v.over, 150 ether);
+        assertEq(v.under, 100 ether);
         assertEq(uint8(v.status), uint8(HamsterHour.Status.Open));
         assertEq(v.closesAt, GENESIS);
         assertEq(v.timeoutAt, GENESIS + HOUR + 48 hours);
-        assertEq(game.bettorCount(0), 256);
+        // Settlement and finalization cost does not depend on the number of bettors.
+        _settle(0, 2500);
+        uint256 gasBefore = gasleft();
+        game.finalize(1);
+        assertLt(gasBefore - gasleft(), 300_000);
+        assertEq(game.totalEligibleLoss(0), 100 ether, "the losing UNDER side; SNOOZE one-sided");
+        assertEq(game.claimable(0, alice), 1 ether, "SNOOZE refund");
+        assertEq(game.lossOf(0, alice), 100 ether);
     }
 }

@@ -14,6 +14,19 @@ interface IIntake {
         returns (bytes32 requestId);
 }
 
+/// @notice The same purchase, plus a function on the callback target that hears a refusal (status 1)
+/// or a panel that ended without a result (status 2). From imd.fun/docs, "Pay onchain".
+interface IIntakeWithFailure {
+    function requestWithFailure(
+        bytes32 action,
+        bytes calldata body,
+        IIntake.Callback calldata callback,
+        bytes4 onFailure,
+        address asset,
+        uint256 amount
+    ) external returns (bytes32 requestId);
+}
+
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);

@@ -19,9 +19,9 @@ contract ConservationTest is GameTest {
 
     function _owed(uint256 windows) internal view returns (uint256 total) {
         // claimable() already includes finalized jackpot shares, so do not count them twice.
+        // Pending deposits and in-flight jackpot money are inside trackedLiabilities().
         total = game.trackedLiabilities() - game.jackpotOutstanding();
         for (uint256 k; k < windows; ++k) {
-            total += game.pendingJackpotDeposits(k);
             for (uint256 i; i < players.length; ++i) {
                 total += game.claimable(k, players[i]);
             }
@@ -56,19 +56,27 @@ contract ConservationTest is GameTest {
         }
         assertEq(_held(), paidIn);
         _settle(0, result0 % 6000);
+        assertEq(_held(), game.trackedLiabilities() + game.windowFunds(0) + game.windowFunds(1), "all in a view");
         if (timeout1) _timeout(1);
         else _settle(1, result1 % 6000);
         assertGe(_held(), _owed(2));
-        game.finalize(5);
-        assertEq(game.nextFinalizeWindow(), 2);
+        // Claims before finalization or fee allocation never underpay or overpay.
+        uint256 early;
+        for (uint256 i; i < players.length; ++i) {
+            if (game.claimable(1, players[i]) > 0) early += _claim(players[i], 1);
+        }
         assertGe(_held(), _owed(2));
-        // Loss history equals the sum of the per-account rule.
+        game.finalize(5);
+        assertGe(game.nextFinalizeWindow(), 2);
+        assertGe(_held(), _owed(2));
+        // Loss history is the pool-level netted loss: at least the sum of the per-account rule
+        // (accounts holding several sides net within themselves), up to rounding dust.
         for (uint256 k; k < 2; ++k) {
             uint256 sum;
             for (uint256 i; i < players.length; ++i) {
                 sum += game.lossOf(k, players[i]);
             }
-            assertEq(game.totalEligibleLoss(k), sum);
+            assertLe(sum, game.totalEligibleLoss(k) + 2 * players.length);
         }
         assertEq(game.cumulativeLossAfter(1), game.totalEligibleLoss(0) + game.totalEligibleLoss(1));
         // Everyone claims; pull balances drain; what remains is tracked (seed, reserve, held fees, dust).
@@ -85,6 +93,8 @@ contract ConservationTest is GameTest {
         uint256 dust = game.windowFunds(0) + game.windowFunds(1);
         assertLt(dust, 8, "rounding dust is bounded by one unit per payout");
         assertEq(_held(), game.trackedLiabilities() + dust);
+        assertEq(game.jackpotInFlight(), 0);
+        assertEq(game.totalPendingJackpotDeposits(), 0);
         assertEq(game.jackpotOutstanding(), 0);
         assertGe(_held(), _owed(2));
     }
