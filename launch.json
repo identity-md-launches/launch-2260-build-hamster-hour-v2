@@ -1,0 +1,14 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "HamsterHour",
+      "constructorArgs": [
+        "$owner",
+        "0x5598aa9146215bc13eb26f2c692ad1461fd32982",
+        "0xa43e6f75ee006411f79ac1c84120606c2330de82"
+      ]
+    }
+  ],
+  "notes": "Deploys the accepted src/HamsterHour.sol on Ethereum mainnet. Constructor order is team_, attester_, intake_. TEAM is $owner, the launch wallet, and receives the 1% TEAM share. Its configuration powers are the 12-hour timelocked line change for subsequently created windows and one-time staking and tip recipient settings; those recipients' fees accrue until set. There is no owner, pause, upgrade or arbitrary withdrawal authority. The constructor is nonpayable, makes no external calls and requires no initialization. IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7, genesis 1791847200, 600-second rounds, six-round windows and initial line 2100 are source constants. The oracle attester was verified against GET https://api.imd.fun/oracle/requests and the real signed attestation at https://api.imd.fun/oracle/requests/753b4996-34e7-420a-8768-d784231195da/attestation; its signature is reproduced and recovered in test/Oracle.t.sol. The domain is IdentityMD Oracle, version 2, chain 1, with this deployed HamsterHour as verifyingContract. Intake is the existing IMD on-chain Intake documented at https://imd.fun/docs/#pay-onchain; requests spend 0.5 IMD from the separately funded oracle reserve, with no settler reimbursement. Settlement, timeout and claims remain available with an empty reserve. OracleAttestation is an internal library, so no separate verifier or library deployment is needed. The Intake is checked on first use, not in the constructor, so deployment on an empty chain succeeds. The v1 address 0xc5217f129da200a8e86229de4eabf3686eef64b1 is not a dependency. Loss history (totalEligibleLoss, cumulativeLossBefore, cumulativeLossAfter) is computed at pool level in _poolLoss with no loop over users; the only per-window loop at finalization counts winning EXACT guesses over at most 256 tickets, the cap the brief sets."
+}
