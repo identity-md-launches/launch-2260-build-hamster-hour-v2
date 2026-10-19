@@ -504,6 +504,152 @@ contract EdgesTest is GameTest {
         assertEq(game.cumulativeLossBefore(1), game.cumulativeLossAfter(0));
     }
 
+    // ------------------------------------------------------------------ loss history rounding
+    /// @dev Three winners whose shares do not divide, and a losing side small enough that the 9%
+    /// fee leaves the winners short: every lossOf rounds in the account's disfavour by under one
+    /// wei, and the sum never passes the stored pool-level total.
+    function test_lossOfShortfallRoundsDownAndSumStaysWithinTotal() public {
+        _ou(alice, 0, true, 1 ether + 1);
+        _ou(bob, 0, true, 1 ether + 2);
+        _ou(carol, 0, true, 4 ether + 7);
+        _ou(keeper, 0, false, 0.5 ether);
+        _settle(0, 2500);
+        vm.warp(block.timestamp + 48 hours);
+        game.finalize(1);
+        address[3] memory w = [alice, bob, carol];
+        uint256[3] memory paid = [uint256(1 ether + 1), 1 ether + 2, 4 ether + 7];
+        uint256 sum = game.lossOf(0, keeper);
+        assertEq(game.lossOf(0, keeper), 0.5 ether);
+        for (uint256 i; i < 3; ++i) {
+            uint256 real = paid[i] - game.claimable(0, w[i]);
+            uint256 l = game.lossOf(0, w[i]);
+            assertLe(l, real, "recorded loss never above the real one");
+            assertLe(real - l, 1, "and short of it by under one wei");
+            assertGt(l, 0, "winners with a shortfall still record a loss");
+            sum += l;
+        }
+        uint256 total = game.totalEligibleLoss(0);
+        assertLe(sum, total, "sum of lossOf <= totalEligibleLoss");
+        assertLe(total - sum, 3, "one wei per winning account at most");
+        // Stable across claims.
+        for (uint256 i; i < 3; ++i) {
+            uint256 before = game.lossOf(0, w[i]);
+            _claim(w[i], 0);
+            assertEq(game.lossOf(0, w[i]), before);
+        }
+    }
+
+    /// @dev lossOf nets an account across both markets, the stored total counts each losing side in
+    /// full. So an ordinary bettor who wins one market and loses the other (no same-market hedge)
+    /// already makes the total exceed the sum, as the README's "more than one side" caveat says.
+    /// Safe direction only: a vault paying reward * lossOf / total under-distributes.
+    function test_crossMarketNettingLeavesTotalAboveSum() public {
+        _ou(alice, 0, true, 10 ether);
+        _sn(alice, 0, true, 20 ether);
+        _ou(bob, 0, false, 30 ether);
+        _sn(bob, 0, false, 20 ether);
+        _settle(0, 2500); // OVER wins, NO wins
+        vm.warp(block.timestamp + 48 hours);
+        game.finalize(1);
+        assertEq(game.lossOf(0, alice), 0, "alice's OVER win (36.4) covers her lost YES (20)");
+        assertEq(game.lossOf(0, bob), 50 ether - 36.4 ether);
+        assertEq(game.totalEligibleLoss(0), 30 ether + 20 ether, "both losing sides in full");
+        assertEq(game.cumulativeLossAfter(0), 50 ether);
+    }
+
+    /// @dev A reserve-paid request made after end + 24h never holds the public path at all; the
+    /// public settle wins, the reserve is charged once, and the late delivery is refused.
+    function test_requestAfterGraceDoesNotHoldPublicSettle() public {
+        _fourWay(0);
+        vm.prank(carol);
+        game.fundOracleReserve(0.5 ether);
+        uint64 end = game.windowEnd(0);
+        vm.warp(end + 30 hours);
+        bytes32 id = game.requestOracle(0);
+        assertEq(game.oracleReserve(), 0);
+        assertTrue(game.oracleRequestPending(0));
+        assertFalse(game.publicSettleHeld(0));
+        vm.expectRevert(HamsterHour.AlreadyRequested.selector);
+        game.requestOracle(0);
+        _settle(0, 50);
+        assertEq(game.windowInfo(0).result, 50);
+        assertFalse(game.publicSettleHeld(0));
+        OracleAttestation.Attestation memory b = _attestation(0, 2500, uint64(block.timestamp));
+        assertFalse(intake.deliver(id, b, _sign(b, ATTESTER_KEY, address(game))), "late delivery refused");
+        assertEq(game.windowInfo(0).result, 50, "public answer stands");
+        vm.expectRevert(HamsterHour.NotSettleable.selector);
+        game.requestOracle(0);
+        // Asleep: OVER/UNDER refunded in full, SNOOZE pays YES.
+        assertEq(game.claimable(0, alice), 10 ether + 40 ether * 91 / 100);
+        assertEq(game.claimable(0, bob), 30 ether);
+    }
+
+    /// @dev The hold is a strict "<" on end + 24h whichever second the request is made in.
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_publicSettleHoldEndsAtEndPlus24h(uint256 requestAt, uint256 checkAt) public {
+        _fourWay(0);
+        vm.prank(carol);
+        game.fundOracleReserve(0.5 ether);
+        uint64 end = game.windowEnd(0);
+        requestAt = bound(requestAt, end, uint256(end) + 48 hours - 1);
+        vm.warp(requestAt);
+        game.requestOracle(0);
+        checkAt = bound(checkAt, requestAt, uint256(end) + 48 hours - 1);
+        vm.warp(checkAt);
+        bool pending = checkAt < requestAt + 1 days;
+        assertEq(game.oracleRequestPending(0), pending);
+        assertEq(game.publicSettleHeld(0), pending && checkAt < uint256(end) + 24 hours);
+        OracleAttestation.Attestation memory a = _attestation(0, 2500, uint64(block.timestamp));
+        bytes memory sig = _sign(a, ATTESTER_KEY, address(game));
+        if (game.publicSettleHeld(0)) {
+            vm.expectRevert(HamsterHour.PaidRequestPending.selector);
+            game.settle(0, a, sig);
+        } else {
+            game.settle(0, a, sig);
+            assertEq(uint8(game.windowInfo(0).status), uint8(HamsterHour.Status.Settled));
+        }
+    }
+
+    /// @dev Random stakes and sides for four accounts across both markets: each lossOf is within two
+    /// wei below the real loss (one per winning side), never above, and the sum stays within the
+    /// stored total; with one side per account the total is the sum up to one wei per account.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_lossOfBoundsAndSumWithinTotal(uint256[4] memory stakes, uint8 sides, uint256 result) public {
+        address[4] memory who = [alice, bob, carol, keeper];
+        result = bound(result, 0, 4000);
+        bool oneSideEach = sides & 0x80 == 0;
+        uint256[4] memory paid;
+        for (uint256 i; i < 4; ++i) {
+            uint256 amt = bound(stakes[i], 0.5 ether, 1000 ether + 999);
+            bool side = (sides >> i) & 1 == 1;
+            if (i < 2) _ou(who[i], 0, side, amt);
+            else _sn(who[i], 0, side, amt);
+            paid[i] = amt;
+            if (!oneSideEach) {
+                // Each account also takes a side of the other market.
+                uint256 extra = 0.5 ether + amt / 3 + i;
+                if (i < 2) _sn(who[i], 0, !side, extra);
+                else _ou(who[i], 0, !side, extra);
+                paid[i] += extra;
+            }
+        }
+        _settle(0, result);
+        vm.warp(block.timestamp + 48 hours);
+        game.finalize(1);
+        uint256 sum;
+        for (uint256 i; i < 4; ++i) {
+            uint256 back = game.claimable(0, who[i]);
+            uint256 real = paid[i] > back ? paid[i] - back : 0;
+            uint256 l = game.lossOf(0, who[i]);
+            assertLe(l, real, "recorded loss never above the real one");
+            assertLe(real - l, 2, "under one wei short per winning side");
+            sum += l;
+        }
+        uint256 total = game.totalEligibleLoss(0);
+        assertLe(sum, total, "sum of lossOf <= totalEligibleLoss");
+        if (oneSideEach) assertLe(total - sum, 4, "exact up to rounding when nobody holds two sides");
+    }
+
     // ------------------------------------------------------------------ fuzz
     /// forge-config: default.fuzz.runs = 1000
     function testFuzz_exactBandFullRange(uint256 guess, uint256 result) public view {

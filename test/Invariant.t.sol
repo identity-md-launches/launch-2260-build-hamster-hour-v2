@@ -34,8 +34,13 @@ contract HamsterHandler is Test {
     bool public claimPaidWrong;
     bool public settledWindowReopened;
     mapping(uint256 => uint8) public lastStatus;
-    /// @dev Window k has an actor holding both sides of one binary market.
+    /// @dev Window k has an actor holding more than one binary side (either market): its
+    /// netted lossOf may then be below what the pool-level total counts for it.
     mapping(uint256 => bool) public hedged;
+    bool public lossSumAboveTotal;
+    bool public heldPastGrace;
+    uint256 public settlesOverUnheldRequest;
+    uint256 public finalizedWithLoss;
     uint256 public calls;
     uint256 public settles;
     uint256 public claims;
@@ -81,7 +86,9 @@ contract HamsterHandler is Test {
         amount = bound(amount, 0.5 ether, 200 ether);
         address a = _actor(actorSeed);
         HamsterHour.Position memory p = game.position(k, a);
-        if (snooze ? (side ? p.no : p.yes) > 0 : (side ? p.under : p.over) > 0) hedged[k] = true;
+        uint256 sides = (p.over > 0 ? 1 : 0) + (p.under > 0 ? 1 : 0) + (p.yes > 0 ? 1 : 0) + (p.no > 0 ? 1 : 0);
+        bool already = snooze ? (side ? p.yes : p.no) > 0 : (side ? p.over : p.under) > 0;
+        if (sides > 1 || (sides == 1 && !already)) hedged[k] = true;
         vm.prank(a);
         if (snooze) game.betSnooze(k, side, amount);
         else game.betOverUnder(k, side, amount);
@@ -106,8 +113,14 @@ contract HamsterHandler is Test {
         ++calls;
         if (windows.length == 0) return;
         (bool found, uint256 k) = _findSettleable(idxSeed);
-        if (!found || game.oracleRequestPending(k)) return;
+        if (!found) return;
         HamsterHour.WindowView memory v = game.windowInfo(k);
+        if (game.publicSettleHeld(k)) {
+            // The hold never outlives end + 24h, whatever requests were paid or renewed.
+            if (block.timestamp >= v.endsAt + 24 hours) heldPastGrace = true;
+            return;
+        }
+        if (game.oracleRequestPending(k)) ++settlesOverUnheldRequest;
         uint256[8] memory results = [uint256(0), 99, 100, v.line, v.line + 1, 2000, 2010, 1990];
         uint256 result = resultSeed % 3 == 0 ? bound(resultSeed, 0, 5000) : results[resultSeed % 8];
         (OracleAttestation.Attestation memory a, bytes memory sig) = _signed(k, result);
@@ -120,6 +133,7 @@ contract HamsterHandler is Test {
         if (windows.length == 0) return;
         (bool found, uint256 k) = _findSettleable(idxSeed);
         if (!found || game.oracleRequestPending(k) || !game.hasFeePayingActivity(k)) return;
+        if (game.publicSettleHeld(k)) heldPastGrace = true; // held without a pending request
         if (game.oracleReserve() < 0.5 ether) return;
         bytes32 id = game.requestOracle(k);
         ghostOut += 0.5 ether;
@@ -165,6 +179,15 @@ contract HamsterHandler is Test {
         game.finalize(bound(n, 0, 64));
         uint256 next = game.nextFinalizeWindow();
         if (next < lastNextFinalize) finalizeWentBackwards = true;
+        for (uint256 k = lastNextFinalize; k < next; ++k) {
+            if (game.totalEligibleLoss(k) == 0) continue;
+            ++finalizedWithLoss;
+            uint256 sum;
+            for (uint256 j; j < 4; ++j) {
+                sum += game.lossOf(k, actors[j]);
+            }
+            if (sum > game.totalEligibleLoss(k)) lossSumAboveTotal = true;
+        }
         lastNextFinalize = next;
     }
 
@@ -346,6 +369,12 @@ contract HamsterInvariantTest is Test {
         targetContract(address(handler));
     }
 
+    /// @dev Not an invariant: shows the sequences actually reach the states the invariants guard.
+    function afterInvariant() public view {
+        if (handler.calls() < 100) return;
+        assertGt(handler.settles() + handler.timeouts(), 0, "some window reached a terminal state");
+    }
+
     function _accounted() internal view returns (uint256 total) {
         total = game.trackedLiabilities();
         uint256 n = handler.windowCount();
@@ -401,6 +430,8 @@ contract HamsterInvariantTest is Test {
         assertFalse(handler.lossChangedOnClaim(), "lossOf stable across claims");
         assertFalse(handler.claimPaidWrong(), "claim pays exactly claimable once");
         assertFalse(handler.settledWindowReopened(), "terminal status never changes");
+        assertFalse(handler.lossSumAboveTotal(), "sum of lossOf <= totalEligibleLoss at finalization");
+        assertFalse(handler.heldPastGrace(), "public settle never held at or past end + 24h");
         uint256 next = game.nextFinalizeWindow();
         uint256 n = handler.windowCount();
         for (uint256 i; i < n; ++i) {
@@ -418,11 +449,12 @@ contract HamsterInvariantTest is Test {
                 for (uint256 j; j < 4; ++j) {
                     sum += game.lossOf(k, handler.actors(j));
                 }
-                // Pool-level total (README "Mining history"): equal to the sum when nobody holds both
-                // sides of a market, an upper bound (plus floor dust) when an account hedges.
-                assertLe(sum, game.totalEligibleLoss(k) + 8, "sum of lossOf <= stored loss");
+                // Pool-level total (README "Mining history"): never below the sum (lossOf rounds
+                // payouts up), and equal to it up to one wei per winning account when nobody holds
+                // more than one binary side in the window.
+                assertLe(sum, game.totalEligibleLoss(k), "sum of lossOf <= stored loss, no dust over");
                 if (!handler.hedged(k)) {
-                    assertApproxEqAbs(game.totalEligibleLoss(k), sum, 8, "stored loss == sum of lossOf");
+                    assertApproxEqAbs(game.totalEligibleLoss(k), sum, 4, "stored loss == sum of lossOf");
                 }
                 if (v.status == HamsterHour.Status.TimedOut) assertEq(game.totalEligibleLoss(k), 0);
             }
