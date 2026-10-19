@@ -211,6 +211,45 @@ contract MarketsTest is GameTest {
         assertEq(game.cumulativeLossAfter(1), sum0 + 1 ether + 1000 ether - winnerPool);
     }
 
+    function test_lossSumNeverExceedsTotalWithRoundedWinnerShortfall() public {
+        // Three winners share an uneven pool with a shortfall. Claims round each share down; the
+        // per-account loss rounds it up, so the sum of lossOf stays within the pool-level total.
+        _ou(alice, 0, false, 7 ether);
+        _ou(bob, 0, false, 7 ether);
+        _ou(carol, 0, false, 7 ether);
+        _ou(keeper, 0, true, 0.5 ether);
+        // Window 1: a hedger holds both sides of SNOOZE next to a plain OVER/UNDER market.
+        _ou(alice, 1, true, 10 ether);
+        _ou(bob, 1, false, 10 ether);
+        _sn(carol, 1, true, 1000 ether);
+        _sn(carol, 1, false, 1000 ether);
+        _settle(0, 2000);
+        _settle(1, 2500);
+        game.finalize(2);
+
+        uint256 winnerPool = 21.5 ether * 91 / 100; // 19.565 IMD for a 21 IMD winning side
+        uint256 floorShare = 7 ether * winnerPool / 21 ether; // inexact: 6.521666... IMD
+        assertTrue(floorShare * 21 ether != 7 ether * winnerPool, "the share does not divide evenly");
+        assertEq(game.claimable(0, alice), floorShare, "claims round down");
+        assertEq(game.lossOf(0, alice), 7 ether - floorShare - 1, "loss rounds the payout up");
+        assertEq(game.lossOf(0, keeper), 0.5 ether);
+        uint256 sum0 = game.lossOf(0, alice) + game.lossOf(0, bob) + game.lossOf(0, carol) + game.lossOf(0, keeper);
+        assertEq(game.totalEligibleLoss(0), 0.5 ether + 21 ether - winnerPool);
+        assertEq(sum0, game.totalEligibleLoss(0) - 1, "one wei under the total per rounded winner, never over");
+        assertLe(sum0, game.totalEligibleLoss(0));
+        // Stable across claims.
+        assertEq(_claim(alice, 0), floorShare);
+        assertEq(game.lossOf(0, alice), 7 ether - floorShare - 1);
+
+        // Hedging: carol's own netting leaves her the 9% fee as loss; the pool-level total counts
+        // the whole losing YES side, so it exceeds the sum of lossOf (documented dilution).
+        assertEq(game.lossOf(1, alice), 0);
+        assertEq(game.lossOf(1, bob), 10 ether);
+        assertEq(game.lossOf(1, carol), 2000 ether - 2000 ether * 91 / 100);
+        assertEq(game.totalEligibleLoss(1), 10 ether + 1000 ether);
+        assertLe(game.lossOf(1, alice) + game.lossOf(1, bob) + game.lossOf(1, carol), game.totalEligibleLoss(1));
+    }
+
     function test_exactTicketRules() public {
         vm.expectRevert(HamsterHour.InvalidGuess.selector);
         _ticket(alice, 0, uint256(type(uint64).max) + 1);

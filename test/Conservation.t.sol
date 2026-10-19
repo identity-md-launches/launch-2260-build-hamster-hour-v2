@@ -69,14 +69,14 @@ contract ConservationTest is GameTest {
         game.finalize(5);
         assertGe(game.nextFinalizeWindow(), 2);
         assertGe(_held(), _owed(2));
-        // Loss history is the pool-level netted loss: at least the sum of the per-account rule
-        // (accounts holding several sides net within themselves), up to rounding dust.
+        // Loss history is the pool-level netted loss: never below the sum of the per-account rule
+        // (accounts holding several sides net within themselves; lossOf rounds payouts up).
         for (uint256 k; k < 2; ++k) {
             uint256 sum;
             for (uint256 i; i < players.length; ++i) {
                 sum += game.lossOf(k, players[i]);
             }
-            assertLe(sum, game.totalEligibleLoss(k) + 2 * players.length);
+            assertLe(sum, game.totalEligibleLoss(k));
         }
         assertEq(game.cumulativeLossAfter(1), game.totalEligibleLoss(0) + game.totalEligibleLoss(1));
         // Everyone claims; pull balances drain; what remains is tracked (seed, reserve, held fees, dust).

@@ -33,6 +33,10 @@ contract HamsterHour {
     /// @notice validForSeconds of the request body: a paid request that neither delivered nor
     /// failed within it is treated as lost, and a new one may be paid.
     uint64 public constant ORACLE_REQUEST_VALIDITY = 86400;
+    /// @notice How long after a window's end an outstanding reserve-paid request may hold the public
+    /// `settle` back. Half the timeout: whatever the Intake does, at least 24 hours of public
+    /// settlement always remain before the window can only time out.
+    uint64 public constant PUBLIC_SETTLE_HOLD = 24 hours;
     uint16 public constant MIN_PANEL = 5;
     uint16 public constant MIN_AGREED = 4;
     uint64 public constant ISSUED_AT_TOLERANCE = 5 minutes;
@@ -123,6 +127,7 @@ contract HamsterHour {
         uint256 pendingJackpotDeposits;
         bool oracleRequested;
         bool oracleRequestPending;
+        bool publicSettleHeld;
         bytes32 intakeRequestId;
         bytes32 requestId;
     }
@@ -407,10 +412,17 @@ contract HamsterHour {
     }
 
     /// @notice True while a reserve-paid request for `k` is outstanding: made, neither delivered nor
-    /// failed, and younger than its validity. Public `settle` waits for it; `requestOracle` refuses
-    /// a second payment while it lasts.
+    /// failed, and younger than its validity. `requestOracle` refuses a second payment while it
+    /// lasts; the public `settle` waits for it only while `publicSettleHeld(k)`.
     function oracleRequestPending(uint256 k) public view returns (bool) {
         return pendingIntakeRequest[k] != bytes32(0) && block.timestamp < oracleRequestedAt[k] + ORACLE_REQUEST_VALIDITY;
+    }
+
+    /// @notice True while the public `settle(k)` must wait for an outstanding reserve-paid request:
+    /// never past `PUBLIC_SETTLE_HOLD` after the window's end, however many requests were paid, so a
+    /// renewed request cannot keep a correctly signed attestation out until the timeout.
+    function publicSettleHeld(uint256 k) public view returns (bool) {
+        return oracleRequestPending(k) && block.timestamp < _windows[k].endsAt + PUBLIC_SETTLE_HOLD;
     }
 
     /// @notice True when window `k` can produce fees that refill the reserve: a two-sided binary
@@ -485,13 +497,14 @@ contract HamsterHour {
     }
 
     /// @notice Settles window `k` from an attestation anyone fetched from the IMD API, and allocates
-    /// its fees. Refused while a reserve-paid request for `k` is outstanding, so the answer the
-    /// contract paid for is the one that settles it.
+    /// its fees. Refused while a reserve-paid request for `k` is outstanding and the window ended
+    /// less than `PUBLIC_SETTLE_HOLD` ago, so the answer the contract paid for is the one that
+    /// settles it; after that the public path is always open until the timeout.
     function settle(uint256 k, OracleAttestation.Attestation calldata a, bytes calldata signature)
         external
         nonReentrant
     {
-        if (oracleRequestPending(k)) revert PaidRequestPending();
+        if (publicSettleHeld(k)) revert PaidRequestPending();
         Window storage w = _windows[k];
         _recordResult(k, w, a, signature);
         _allocate(k, w);
@@ -757,7 +770,7 @@ contract HamsterHour {
             binary = uint256(p.over) + p.under + p.yes + p.no;
             ticket = p.hasTicket ? TICKET_PRICE : 0;
         } else if (w.status == Status.Settled) {
-            binary = _binaryEntitlement(w, p);
+            binary = _binaryEntitlement(w, p, false);
             if (p.hasTicket && w.finalized && w.jackpotShare > 0 && isWinningGuess(p.guess, w.result)) {
                 jackpot = w.jackpotShare;
             }
@@ -780,32 +793,49 @@ contract HamsterHour {
             - pool * BINARY_TEAM_PCT / 100;
     }
 
-    function _binaryEntitlement(Window storage w, Position storage p) private view returns (uint256 amount) {
+    /// @dev Refunds plus pro-rata winnings of both binary markets. Claims round the pro-rata share
+    /// down (`roundUp` false); the loss history rounds it up so no account's recorded loss exceeds
+    /// its real one, which keeps the sum of `lossOf` within the pool-level `totalEligibleLoss`.
+    function _binaryEntitlement(Window storage w, Position storage p, bool roundUp)
+        private
+        view
+        returns (uint256 amount)
+    {
         if (_ouVoid(w)) {
             amount = uint256(p.over) + p.under;
         } else {
             uint256 winners = _winnerPool(uint256(w.over) + w.under);
-            if (w.result > w.line) amount = uint256(p.over) * winners / w.over;
-            else amount = uint256(p.under) * winners / w.under;
+            if (w.result > w.line) amount = _share(p.over, winners, w.over, roundUp);
+            else amount = _share(p.under, winners, w.under, roundUp);
         }
         if (_snVoid(w)) {
             amount += uint256(p.yes) + p.no;
         } else {
             uint256 winners = _winnerPool(uint256(w.yes) + w.no);
-            if (w.result < SNOOZE_THRESHOLD) amount += uint256(p.yes) * winners / w.yes;
-            else amount += uint256(p.no) * winners / w.no;
+            if (w.result < SNOOZE_THRESHOLD) amount += _share(p.yes, winners, w.yes, roundUp);
+            else amount += _share(p.no, winners, w.no, roundUp);
         }
+    }
+
+    /// @dev stake * pool / side, rounded down or up. Both factors fit 128 bits, so no overflow.
+    function _share(uint256 stake, uint256 pool, uint256 side, bool roundUp) private pure returns (uint256 q) {
+        uint256 product = stake * pool;
+        q = product / side;
+        if (roundUp && q * side < product) ++q;
     }
 
     function _loss(Window storage w, Position storage p) private view returns (uint256) {
         uint256 paid = uint256(p.over) + p.under + p.yes + p.no;
-        uint256 back = _binaryEntitlement(w, p);
+        uint256 back = _binaryEntitlement(w, p, true);
         return paid > back ? paid - back : 0;
     }
 
     // ----------------------------------------------------------------- views
     /// @notice Net binary principal lost by `account` in window `k`: max(0, paid - refunds - payouts),
     /// netted across OVER/UNDER and SNOOZE, EXACT excluded. Zero until settled; zero after a timeout.
+    /// Payouts are rounded up here (claims round down), so the value is at most the real loss and
+    /// never off by more than one unit per winning side; the sum over all accounts never exceeds
+    /// `totalEligibleLoss[k]`.
     function lossOf(uint256 k, address account) external view returns (uint256) {
         Window storage w = _windows[k];
         if (w.status != Status.Settled) return 0;
@@ -869,6 +899,7 @@ contract HamsterHour {
         v.pendingJackpotDeposits = pendingJackpotDeposits[k];
         v.oracleRequested = oracleRequestedAt[k] != 0;
         v.oracleRequestPending = oracleRequestPending(k);
+        v.publicSettleHeld = publicSettleHeld(k);
         v.intakeRequestId = pendingIntakeRequest[k];
         v.requestId = w.requestId;
     }

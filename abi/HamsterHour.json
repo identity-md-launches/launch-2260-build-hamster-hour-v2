@@ -295,6 +295,19 @@
   },
   {
     "type": "function",
+    "name": "PUBLIC_SETTLE_HOLD",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "ROUND_DURATION",
     "inputs": [],
     "outputs": [
@@ -1456,6 +1469,25 @@
   },
   {
     "type": "function",
+    "name": "publicSettleHeld",
+    "inputs": [
+      {
+        "name": "k",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "question",
     "inputs": [
       {
@@ -1958,6 +1990,11 @@
           },
           {
             "name": "oracleRequestPending",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "publicSettleHeld",
             "type": "bool",
             "internalType": "bool"
           },

@@ -344,6 +344,66 @@ contract OracleTest is GameTest {
         assertTrue(game.windowInfo(1).ouVoid);
     }
 
+    function test_renewedReserveRequestsCannotHoldPublicSettlePastTheGrace() public {
+        _ou(alice, 0, true, 10 ether);
+        _ou(bob, 0, false, 10 ether);
+        vm.prank(carol);
+        game.fundOracleReserve(1 ether);
+        uint64 end = game.windowEnd(0);
+        vm.warp(end);
+        bytes32 id1 = game.requestOracle(0);
+        assertTrue(game.publicSettleHeld(0));
+        assertTrue(game.windowInfo(0).publicSettleHeld);
+        // First 24 h after the end: the paid request has priority over the public path.
+        vm.warp(end + 24 hours - 1);
+        OracleAttestation.Attestation memory early = _attestation(0, 2500, uint64(block.timestamp));
+        vm.expectRevert(HamsterHour.PaidRequestPending.selector);
+        game.settle(0, early, _sign(early, ATTESTER_KEY, address(game)));
+        // The Intake never calls back; the keeper renews as soon as the first request lapses.
+        vm.warp(end + 1 days);
+        bytes32 id2 = game.requestOracle(0);
+        assertTrue(id2 != id1);
+        assertEq(game.oracleReserve(), 0);
+        assertTrue(game.oracleRequestPending(0), "the renewed request is outstanding");
+        assertFalse(game.publicSettleHeld(0), "but it no longer holds the public path");
+        assertFalse(game.windowInfo(0).publicSettleHeld);
+        vm.expectRevert(HamsterHour.AlreadyRequested.selector);
+        game.requestOracle(0);
+        // A correctly signed attestation settles at the very end of the 48 h despite the renewal.
+        vm.warp(end + 48 hours - 1);
+        _settle(0, 2500);
+        assertEq(uint8(game.windowInfo(0).status), uint8(HamsterHour.Status.Settled));
+        assertEq(_claim(alice, 0), 20 ether * 91 / 100, "winners are paid, not refunded by a timeout");
+        assertEq(game.balances(team), 0.2 ether, "fees were allocated");
+        // The late paid delivery finds the window settled and is refused harmlessly.
+        OracleAttestation.Attestation memory late = _attestation(0, 2600, uint64(block.timestamp));
+        assertFalse(intake.deliver(id2, late, _sign(late, ATTESTER_KEY, address(game))));
+        assertEq(game.windowInfo(0).result, 2500);
+    }
+
+    function test_publicSettleHoldIsMeasuredFromWindowEndNotRequestTime() public {
+        _ou(alice, 0, true, 10 ether);
+        _ou(bob, 0, false, 10 ether);
+        vm.prank(carol);
+        game.fundOracleReserve(1 ether);
+        uint64 end = game.windowEnd(0);
+        // A late first request holds the public path for one hour only, not for its 24 h validity.
+        vm.warp(end + 23 hours);
+        bytes32 id = game.requestOracle(0);
+        assertTrue(game.publicSettleHeld(0));
+        vm.warp(end + 24 hours - 1);
+        assertTrue(game.publicSettleHeld(0));
+        vm.warp(end + 24 hours);
+        assertTrue(game.oracleRequestPending(0));
+        assertFalse(game.publicSettleHeld(0));
+        // The paid request can still deliver after the hold has ended.
+        OracleAttestation.Attestation memory a = _attestation(0, 2500, uint64(block.timestamp));
+        assertTrue(intake.deliver(id, a, _sign(a, ATTESTER_KEY, address(game))));
+        assertEq(game.windowInfo(0).result, 2500);
+        assertFalse(game.oracleRequestPending(0));
+        assertFalse(game.publicSettleHeld(0));
+    }
+
     function test_reserveOnlyPaysForFeePayingWindows() public {
         vm.prank(carol);
         game.fundOracleReserve(10 ether);

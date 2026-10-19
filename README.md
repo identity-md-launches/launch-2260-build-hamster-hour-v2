@@ -140,9 +140,15 @@ The control plane calls back once with 200,000 gas:
 
 A paid request is **outstanding** (`oracleRequestPending(k)`) from `requestOracle` until it
 delivers, fails, or 86,400 s (the body's `validForSeconds`) have passed. While it is outstanding a
-second `requestOracle(k)` reverts `AlreadyRequested` and the public `settle(k, a, sig)` reverts
-`PaidRequestPending`, so the answer the contract paid for is the one that settles the window and a
-bettor's own attestation cannot pre-empt it. After a failure or the lapse, anyone may pay a new
+second `requestOracle(k)` reverts `AlreadyRequested`. The public `settle(k, a, sig)` reverts
+`PaidRequestPending` while `publicSettleHeld(k)`: an outstanding request **and** less than
+`PUBLIC_SETTLE_HOLD` (24 h) since the window's end. So the answer the contract paid for is the one
+that settles the window and a bettor's own attestation cannot pre-empt it, but no sequence of paid
+requests (a request at the end and another after the first lapses, which keepers are told to make)
+can hold the public path past `end + 24h`: the second half of the 48 h settlement period is always
+open to any correctly signed attestation, and an Intake that never calls back costs at most two
+reserve payments, never the window. A later paid request may still deliver through
+`onOracleResult` while the window is open. After a failure or the lapse, anyone may pay a new
 request from the reserve or submit a public attestation; a late delivery of a lapsed request is
 still accepted while the window is open. Timing: a request made at the exact end of a window may
 reach the panel before Squeekchain has published the last round as settled; the panel then ends
@@ -165,7 +171,9 @@ is set once. TEAM's 1% accrues to `balances[TEAM]`. Every recipient pulls with `
 
 `lossOf(k, account) = max(0, binary paid - refund entitlement - payout entitlement)`, netted across
 OVER/UNDER and SNOOZE, EXACT excluded, computed from entitlements so it is identical before and
-after claims; zero while a window is open and zero after a timeout.
+after claims; zero while a window is open and zero after a timeout. The payout entitlement is
+rounded **up** inside `lossOf` while claims round it down, so a recorded loss is never more than
+the real one and is short of it by less than one wei per winning side.
 
 At chronological finalization the contract stores `totalEligibleLoss[k]`, `cumulativeLossBefore[k]`
 and `cumulativeLossAfter[k]` and emits `LossHistory`. `totalEligibleLoss[k]` is computed at pool
@@ -174,10 +182,16 @@ the winning side's shortfall when the 9% fee leaves it less than its stake (a ma
 losers hold under about 9.9% of the winners' stake). Properties, tested:
 
 - it equals the sum of `lossOf` over all accounts whenever no account holds more than one side in
-  the window (the normal case);
-- an account that hedges within itself nets its own loss (`lossOf` is per account), so the sum of
-  `lossOf` is at most `totalEligibleLoss[k]` plus rounding dust (under one wei per winning side
-  per account). A vault paying `reward * lossOf / totalEligibleLoss` therefore never over-distributes.
+  the window and no winner's share needs rounding (the normal case); when the winning side has a
+  shortfall and shares do not divide evenly, the sum is below the total by under one wei per
+  winning account, never above it;
+- an account that hedges within itself nets its own loss (`lossOf` is per account) while the
+  pool-level total counts the whole losing side, so hedging raises `totalEligibleLoss[k]` above
+  the sum of `lossOf` and dilutes other accounts' share of that window; the hedger pays the 9% fee
+  on both legs for it. An exact total would need a loop over users, which the brief forbids.
+
+In every case the sum of `lossOf` over all accounts is at most `totalEligibleLoss[k]`, so a vault
+paying `reward * lossOf / totalEligibleLoss` never over-distributes.
 
 ## Claims and conservation
 
@@ -219,7 +233,7 @@ still required.
 ## Chosen values not fixed by the brief
 
 `OPEN_AHEAD` 24 h, `ISSUED_AT_TOLERANCE` 300 s, `MAX_GUESS` `2^64 - 1`, `ORACLE_REQUEST_VALIDITY`
-86,400 s (equal to the body's `validForSeconds`), source `https://sepolia.squeekchain.com` (as v1
+86,400 s (equal to the body's `validForSeconds`), `PUBLIC_SETTLE_HOLD` 24 h (half the timeout), source `https://sepolia.squeekchain.com` (as v1
 and the live site), Intake body
 `{"window":{"hours":24},"panelSize":5,"quorum":4,"validForSeconds":86400}`, pool cap `uint128`.
 
@@ -229,9 +243,10 @@ and the live site), Intake body
   covers absence. The attester is immutable: if IMD rotates it, a new deployment is needed and open
   windows refund at their timeout.
 - The Intake address is immutable; if IMD moves it, requests can still be paid off-chain and
-  settled through `settle`. While a reserve-paid request is outstanding (at most 24 h), the public
-  path waits for it; a window therefore always has at least 24 h of public settlement before its
-  48 h timeout.
+  settled through `settle`. The public path waits for an outstanding reserve-paid request only
+  until 24 h after the window's end (`PUBLIC_SETTLE_HOLD`), whatever requests were paid or renewed;
+  a window therefore always has at least 24 h of public settlement before its 48 h timeout, and an
+  Intake outage can never force a timeout on a window whose attestation exists.
 - If the attester ever signs two different answers to one question, the first valid one to reach
   the contract through the allowed path is final; the Intake-paid path has priority while it is
   outstanding, nothing more.
