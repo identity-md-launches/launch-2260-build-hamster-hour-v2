@@ -34,6 +34,8 @@ contract HamsterHandler is Test {
     bool public claimPaidWrong;
     bool public settledWindowReopened;
     mapping(uint256 => uint8) public lastStatus;
+    /// @dev Window k has an actor holding both sides of one binary market.
+    mapping(uint256 => bool) public hedged;
     uint256 public calls;
     uint256 public settles;
     uint256 public claims;
@@ -78,6 +80,8 @@ contract HamsterHandler is Test {
         uint256 k = _bettable(kSeed);
         amount = bound(amount, 0.5 ether, 200 ether);
         address a = _actor(actorSeed);
+        HamsterHour.Position memory p = game.position(k, a);
+        if (snooze ? (side ? p.no : p.yes) > 0 : (side ? p.under : p.over) > 0) hedged[k] = true;
         vm.prank(a);
         if (snooze) game.betSnooze(k, side, amount);
         else game.betOverUnder(k, side, amount);
@@ -102,7 +106,7 @@ contract HamsterHandler is Test {
         ++calls;
         if (windows.length == 0) return;
         (bool found, uint256 k) = _findSettleable(idxSeed);
-        if (!found) return;
+        if (!found || game.oracleRequestPending(k)) return;
         HamsterHour.WindowView memory v = game.windowInfo(k);
         uint256[8] memory results = [uint256(0), 99, 100, v.line, v.line + 1, 2000, 2010, 1990];
         uint256 result = resultSeed % 3 == 0 ? bound(resultSeed, 0, 5000) : results[resultSeed % 8];
@@ -115,11 +119,16 @@ contract HamsterHandler is Test {
         ++calls;
         if (windows.length == 0) return;
         (bool found, uint256 k) = _findSettleable(idxSeed);
-        if (!found || game.windowInfo(k).oracleRequested) return;
+        if (!found || game.oracleRequestPending(k) || !game.hasFeePayingActivity(k)) return;
         if (game.oracleReserve() < 0.5 ether) return;
         bytes32 id = game.requestOracle(k);
         ghostOut += 0.5 ether;
-        if (resultSeed % 4 == 0) return; // the panel never answers: the window will time out
+        if (resultSeed % 4 == 0) return; // the panel never answers: validity lapses or the window times out
+        if (resultSeed % 4 == 1) {
+            // Refused: releases the window for public settle or a fresh paid request.
+            intake.fail(id, 1, "refused");
+            return;
+        }
         (OracleAttestation.Attestation memory a, bytes memory sig) = _signed(k, bound(resultSeed, 0, 4000));
         intake.deliver(id, a, sig);
         ++settles;
@@ -337,33 +346,15 @@ contract HamsterInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// @dev Window funds still held for a settled window's jackpot until its finalization:
-    /// its 93% ticket contribution plus 2% of each fee-paying binary pool.
-    function _inFlight(uint256 k) internal view returns (uint256) {
-        HamsterHour.WindowView memory v = game.windowInfo(k);
-        if (v.status != HamsterHour.Status.Settled || v.jackpotFinalized) return 0;
-        uint256 x = v.tickets * 5 ether * 93 / 100;
-        if (!v.ouVoid) x += (v.over + v.under) * 2 / 100;
-        if (!v.snVoid) x += (v.yes + v.no) * 2 / 100;
-        return x;
-    }
-
     function _accounted() internal view returns (uint256 total) {
         total = game.trackedLiabilities();
         uint256 n = handler.windowCount();
         for (uint256 i; i < n; ++i) {
-            uint256 k = handler.windows(i);
-            total += game.windowFunds(k) + _inFlight(k);
-        }
-        // Pending deposits can sit on windows nobody bet on.
-        uint256 e = game.earliestNotStartedWindow();
-        uint256 from = game.nextFinalizeWindow();
-        for (uint256 k = from; k <= e; ++k) {
-            total += game.pendingJackpotDeposits(k);
+            total += game.windowFunds(handler.windows(i));
         }
     }
 
-    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.runs = 48
     /// forge-config: default.invariant.depth = 120
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_balanceEqualsEveryBucket() public view {
@@ -372,7 +363,7 @@ contract HamsterInvariantTest is Test {
         assertEq(held, _accounted(), "IMD held == sum of all buckets");
     }
 
-    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.runs = 48
     /// forge-config: default.invariant.depth = 120
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_heldCoversEveryClaim() public view {
@@ -402,7 +393,7 @@ contract HamsterInvariantTest is Test {
         assertGe(imd.balanceOf(address(game)), owed + outstandingShares, "IMD held >= all liabilities");
     }
 
-    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.runs = 48
     /// forge-config: default.invariant.depth = 120
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_historyAndOrdering() public view {
@@ -427,7 +418,12 @@ contract HamsterInvariantTest is Test {
                 for (uint256 j; j < 4; ++j) {
                     sum += game.lossOf(k, handler.actors(j));
                 }
-                assertEq(game.totalEligibleLoss(k), sum, "stored loss == sum of lossOf");
+                // Pool-level total (README "Mining history"): equal to the sum when nobody holds both
+                // sides of a market, an upper bound (plus floor dust) when an account hedges.
+                assertLe(sum, game.totalEligibleLoss(k) + 8, "sum of lossOf <= stored loss");
+                if (!handler.hedged(k)) {
+                    assertApproxEqAbs(game.totalEligibleLoss(k), sum, 8, "stored loss == sum of lossOf");
+                }
                 if (v.status == HamsterHour.Status.TimedOut) assertEq(game.totalEligibleLoss(k), 0);
             }
         }

@@ -145,16 +145,19 @@ contract EdgesTest is GameTest {
         _ou(bob, 0, false, 10 ether);
         vm.prank(team);
         game.scheduleLine(3000);
-        vm.warp(block.timestamp + 12 hours);
-        vm.prank(team);
-        game.executeLine(3000);
-        // Window 0 keeps 2100: 2101 is OVER even though the live line is now 3000.
+        uint256 from = game.nextLineFrom();
+        vm.warp(game.nextLineReadyAt());
+        // The window just below `from` opens now and still gets the old line.
+        _ou(carol, from - 1, true, 1 ether);
+        assertEq(game.windowInfo(from - 1).line, 2100);
+        // Window 0 keeps 2100: 2101 is OVER even though the scheduled line is 3000.
         _settle(0, 2101);
         assertEq(game.windowInfo(0).line, 2100);
         assertEq(game.claimable(0, alice), 20 ether * 91 / 100);
         assertEq(game.claimable(0, bob), 0);
-        // A window created later uses 3000: exactly 3000 is UNDER.
-        uint256 k = game.earliestNotStartedWindow();
+        // A window created from `from` on uses 3000: exactly 3000 is UNDER.
+        uint256 k = from;
+        vm.warp(game.windowStart(k) - 24 hours);
         _ou(alice, k, true, 10 ether);
         _ou(bob, k, false, 10 ether);
         _settle(k, 3000);
@@ -314,25 +317,61 @@ contract EdgesTest is GameTest {
         vm.prank(carol);
         game.fundOracleReserve(1 ether);
         bytes32 id = game.requestOracle(0);
-        // Someone settles directly first; the late callback is refused, no double settle.
+        // While the paid request is outstanding a public settle is refused.
         OracleAttestation.Attestation memory a = _attestation(0, 2500, uint64(block.timestamp));
-        game.settle(0, a, _sign(a, ATTESTER_KEY, address(game)));
+        bytes memory sigA = _sign(a, ATTESTER_KEY, address(game));
+        vm.expectRevert(HamsterHour.PaidRequestPending.selector);
+        game.settle(0, a, sigA);
+        // One second before validity lapses it is still pending; at the lapse it is not.
+        vm.warp(block.timestamp + 1 days - 1);
+        assertTrue(game.oracleRequestPending(0));
+        vm.warp(block.timestamp + 1);
+        assertFalse(game.oracleRequestPending(0));
+        game.settle(0, a, sigA);
+        // The late callback for the lapsed request is refused: no second settlement.
         OracleAttestation.Attestation memory b = _attestation(0, 50, uint64(block.timestamp));
         vm.expectRevert(HamsterHour.NotSettleable.selector);
-        intake.deliver(id, b, _sign(b, ATTESTER_KEY, address(game)));
+        intake.deliverStrict(id, b, _sign(b, ATTESTER_KEY, address(game)));
         assertEq(game.windowInfo(0).result, 2500);
 
         // A callback that arrives after the timeout is refused too.
-        _ou(alice, 20, true, 1 ether);
-        vm.warp(game.windowEnd(20));
-        bytes32 id20 = game.requestOracle(20);
-        vm.warp(game.windowEnd(20) + 48 hours);
-        OracleAttestation.Attestation memory c = _attestation(20, 2500, game.windowEnd(20));
+        uint256 k = game.earliestNotStartedWindow();
+        _ou(alice, k, true, 1 ether);
+        _ou(bob, k, false, 1 ether);
+        vm.warp(game.windowEnd(k));
+        bytes32 idK = game.requestOracle(k);
+        vm.warp(game.windowEnd(k) + 48 hours);
+        OracleAttestation.Attestation memory c = _attestation(k, 2500, game.windowEnd(k));
         c.expiresAt = uint64(block.timestamp) + 1;
         vm.expectRevert(HamsterHour.NotSettleable.selector);
-        intake.deliver(id20, c, _sign(c, ATTESTER_KEY, address(game)));
-        game.timeout(20);
-        assertEq(_claim(alice, 20), 1 ether);
+        intake.deliverStrict(idK, c, _sign(c, ATTESTER_KEY, address(game)));
+        game.timeout(k);
+        assertEq(_claim(alice, k), 1 ether);
+        assertEq(_claim(bob, k), 1 ether);
+        // The same request id delivered twice, or a stranger calling the callback, is refused.
+        vm.expectRevert(HamsterHour.NotIntake.selector);
+        game.onOracleResult(idK, c, "");
+        vm.expectRevert(HamsterHour.NotIntake.selector);
+        game.onOracleFailure(idK, 1, "x", 0, 0, "");
+    }
+
+    function test_failedRequestIdCannotDeliverLater() public {
+        _fourWay(0);
+        vm.warp(game.windowEnd(0));
+        vm.prank(carol);
+        game.fundOracleReserve(1 ether);
+        bytes32 id = game.requestOracle(0);
+        assertTrue(intake.fail(id, 2, "no result"));
+        assertFalse(game.oracleRequestPending(0));
+        // A delivery for the failed id is an unknown request; a second failure call too.
+        OracleAttestation.Attestation memory a = _attestation(0, 2500, uint64(block.timestamp));
+        bytes memory sig = _sign(a, ATTESTER_KEY, address(game));
+        vm.expectRevert(HamsterHour.UnknownRequest.selector);
+        intake.deliverStrict(id, a, sig);
+        assertFalse(intake.fail(id, 1, "again"));
+        // The window settles publicly with a valid attestation.
+        game.settle(0, a, sig);
+        assertEq(uint8(game.windowInfo(0).status), uint8(HamsterHour.Status.Settled));
     }
 
     function test_callbackForOneWindowCannotSettleAnother() public {
@@ -344,8 +383,13 @@ contract EdgesTest is GameTest {
         bytes32 id0 = game.requestOracle(0);
         // A result for window 1's question delivered on window 0's request id is the wrong question.
         OracleAttestation.Attestation memory a = _attestation(1, 50, uint64(block.timestamp));
+        bytes memory sig = _sign(a, ATTESTER_KEY, address(game));
         vm.expectRevert(HamsterHour.WrongQuestion.selector);
-        intake.deliver(id0, a, _sign(a, ATTESTER_KEY, address(game)));
+        intake.deliverStrict(id0, a, sig);
+        // Under the real stipend it fails silently and window 0 stays pending, window 1 open.
+        assertFalse(intake.deliver(id0, a, sig));
+        assertTrue(game.oracleRequestPending(0));
+        assertEq(uint8(game.windowInfo(1).status), uint8(HamsterHour.Status.Open));
     }
 
     // ------------------------------------------------------------------ TEAM powers
@@ -354,7 +398,7 @@ contract EdgesTest is GameTest {
         for (uint256 i; i < 3; ++i) {
             vm.startPrank(others[i]);
             vm.expectRevert(HamsterHour.NotTeam.selector);
-            game.executeLine(2100);
+            game.scheduleLine(2100);
             vm.expectRevert(HamsterHour.NotTeam.selector);
             game.scheduleStakingRecipient(alice);
             vm.expectRevert(HamsterHour.NotTeam.selector);
@@ -453,7 +497,11 @@ contract EdgesTest is GameTest {
         game.finalize(0);
         assertEq(game.nextFinalizeWindow(), 0);
         game.finalize(type(uint256).max);
-        assertEq(game.nextFinalizeWindow(), 1, "unbounded request still stops at the first open window");
+        // Window 1 was never created and has started (now == its start), so it finalizes empty;
+        // window 2 has not started and stops the cursor.
+        assertEq(game.nextFinalizeWindow(), 2, "unbounded request stops at the first unstarted window");
+        assertEq(game.totalEligibleLoss(1), 0);
+        assertEq(game.cumulativeLossBefore(1), game.cumulativeLossAfter(0));
     }
 
     // ------------------------------------------------------------------ fuzz
